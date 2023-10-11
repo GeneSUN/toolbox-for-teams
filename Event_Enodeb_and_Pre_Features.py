@@ -474,7 +474,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
     start_date_str = "2023-09-01"
-    end_date_str = "2023-10-10"
+    end_date_str = "2023-09-30"
     #----------------------------------------------------------------------------------------------------------------------------
 
     date_range = get_date_range(start_date_str, end_date_str)
@@ -499,7 +499,7 @@ if __name__ == "__main__":
         date_start = date_td - timedelta(days = 1)
         date_start_str = str(date_start)
         
-        df_kpis = union_df_from_date_start(date_start_str, forward_day = 16)
+        df_kpis = union_df_from_date_start(date_start_str, forward_day = 15)
         
 
         # leave columns in String_typeCols_List as they were, cast other columns to numercial(double)

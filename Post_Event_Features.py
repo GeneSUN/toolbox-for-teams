@@ -289,9 +289,9 @@ def calculate_metrics(date_before_td, date_val):
     # step 2. obtain post feature of enodeb in event_enodeb_list at date_before_td
     
     file_location = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/rohitkovvuri/nokia_fsm_kpis_updated_v2/NokiaFSMKPIsSNAP_{}.csv".format(date_before_td)
-    df_kpis = spark.read.option("header", "true").csv(file_location) 
+    df_kpis = spark.read.option("header", "true").csv(file_location)
+    df_kpis = pad_six_char(df_kpis)
     df_kpis_cur_list =df_kpis.filter(col('ENODEB').isin(enodeb_maintained_list) )
-    df_kpis_cur_list = pad_six_char(df_kpis_cur_list)
     df_kpis_cur_list = fill_allday_zero_with_NA(df_kpis_cur_list, features_list = SEA_list)
     # only consider SEA_SIU features, so exclude FSM_list
     exclude_columns = FSM_list
@@ -547,7 +547,7 @@ if __name__ == "__main__":
     df_enb_cord.count()
 
     # only consider September Data----------------------------------------------------------------------------------------
-    date_range_1 = generate_date_range('2023-10-06', days = 0)
+    date_range_1 = generate_date_range('2023-10-01', days = 30)
 
     for i in range(len(date_range_1)):
         
