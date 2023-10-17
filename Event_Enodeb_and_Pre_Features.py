@@ -28,7 +28,7 @@ except ImportError:
     from io import StringIO, BytesIO  # for Python 3 
 
 
-def adjust_date(date_str, del_days, date_format, direction='backward'): 
+def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backward'): 
     """ 
     Adjust a given date string by adding or subtracting a specified number of days. 
     Args: 
@@ -105,7 +105,7 @@ def union_df_from_date_start(date_start, forward_day = 16):
     # this step is to check if the first dataframe prepared for union is missing,
     # if missing, directly return the warning
     if df_kpis.columns == column_list:
-        print(date_start,df_kpis.count())
+        #print(date_start,df_kpis.count())
         pass
     else:
         print("There is no data in {}".format(date_start))
@@ -475,10 +475,10 @@ if __name__ == "__main__":
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
     start_date_str = "2023-09-01"
     end_date_str = "2023-09-30"
-    #----------------------------------------------------------------------------------------------------------------------------
-
     date_range = get_date_range(start_date_str, end_date_str)
-
+    #----------------------------------------------------------------------------------------------------------------------------
+    date_range =[datetime.now().date()]
+    #----------------------------------------------------------------------------------------------------------------------------
     column_list = ['DAY', 'MMEPOOL', 'REGION', 'MARKET', 'MARKET_DESC', 'SITE', 'ENODEB', 'FSM_LTE_CtxDrop%', 'FSM_VOLTE_ERAB_QCI1_Drop%', 'FSM_LTE_CtxSF%', 'S1U_SIP_SC_CallDrop%', 'FSM_LTE_AvgRRCUsers', 'FSM_LTE_DLRLCMBytes', 'FSM_LTE_DL_BurstTputMbps', 'SEA_ContextDropRate_%', 'SEA_ERABDropRateQCI1_%', 'SEA_ContextSetupFailure_%', 'SEA_AvgRRCconnectedUsers_percell', 'SEA_TotalDLRLCLayerDataVolume_MB', 'SEA_DLUserPerceivedTput_Mbps', 'FSM_LTE_DLRLCReTx%', 'FSM_LTE_DLResidBLER%', 'SEA_DLRLCReTx_%', 'SEA_DLResidualBLER_%', 'FSM_LTE_RRCF%', 'SEA_RRCSetupFailure_%', 'FSM_LTE_DataERABDrop%', 'SEA_DefaultERABDropRate_%']
 
     FSM_list = [element for element in column_list if element[:3] == "FSM"]
