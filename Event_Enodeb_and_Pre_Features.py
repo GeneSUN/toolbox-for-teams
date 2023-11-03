@@ -54,7 +54,7 @@ def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backwar
         raise ValueError("Invalid direction argument. Use 'forward' or 'backward'.") 
     return adjusted_date.strftime(date_format)
 
-def pad_char(df, desired_length = 7   ,column_name="ENODEB"):
+def pad_char(df, desired_length = 6   ,column_name="ENODEB"):
     """ 
     Ensures that all values in the specified column have exactly 6 characters. 
     If a value has 5 characters, it adds a '0' in front of it to make it 6 characters. 
@@ -472,7 +472,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
     start_date_str = "2023-10-15"
-    end_date_str = "2023-11-02"
+    end_date_str = "2023-11-03"
     date_range = get_date_range(start_date_str, end_date_str)
     #----------------------------------------------------------------------------------------------------------------------------
     date_range =[datetime.now().date()]
