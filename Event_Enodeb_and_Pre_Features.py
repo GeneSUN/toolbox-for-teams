@@ -54,7 +54,7 @@ def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backwar
         raise ValueError("Invalid direction argument. Use 'forward' or 'backward'.") 
     return adjusted_date.strftime(date_format)
 
-def pad_six_char(df, column_name="ENODEB"):
+def pad_char(df, desired_length = 7   ,column_name="ENODEB"):
     """ 
     Ensures that all values in the specified column have exactly 6 characters. 
     If a value has 5 characters, it adds a '0' in front of it to make it 6 characters. 
@@ -62,11 +62,9 @@ def pad_six_char(df, column_name="ENODEB"):
     :param column_name: The name of the column to process. 
     :return: The DataFrame with the specified column updated. 
     """ 
-    df = df.withColumn( 
-        column_name, 
-        when(length(col(column_name)) < 6, lpad( df[column_name], 6,'0' ) ).otherwise(col(column_name)) 
-    ) 
-    return df
+    df_padded = df.withColumn(column_name, lpad(col(column_name), desired_length, '0')) 
+
+    return df_padded
 
 
 
@@ -99,7 +97,7 @@ def union_df_from_date_start(date_start, forward_day = 16):
     
     df_kpis = spark.read.option("header", "true").csv("hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/rohitkovvuri/nokia_fsm_kpis_updated_v2/NokiaFSMKPIsSNAP_{}.csv".format(date_start)) 
     # Ensures that all values in 'ENODEB' column have exactly 6 characters. If a value has 5 characters, it adds a '0' in front of it
-    df_kpis = pad_six_char(df_kpis)
+    df_kpis = pad_char(df_kpis)
     
     # Check if the DataFrame columns match the provided schema
     # this step is to check if the first dataframe prepared for union is missing,
@@ -119,7 +117,7 @@ def union_df_from_date_start(date_start, forward_day = 16):
         try: 
             # Read the CSV file for the calculated date and remove duplicates 
             df_temp_kpi = spark.read.option("header", "true").csv("hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/rohitkovvuri/nokia_fsm_kpis_updated_v2/NokiaFSMKPIsSNAP_{}.csv".format(date_val)).dropDuplicates() 
-            df_temp_kpi = pad_six_char(df_temp_kpi)
+            df_kpis = pad_char(df_kpis)
             # Union the data from df_temp_kpi with df_kpis and apply filters 
             # After the iteration, we should get all 15-days data from date_start 
             df_kpis = df_kpis.union(df_temp_kpi.select(df_kpis.columns)).filter(~(F.col("ENODEB") == "*")).filter(F.col("ENODEB").isNotNull()) 
@@ -473,8 +471,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
-    start_date_str = "2023-09-01"
-    end_date_str = "2023-09-30"
+    start_date_str = "2023-10-15"
+    end_date_str = "2023-11-02"
     date_range = get_date_range(start_date_str, end_date_str)
     #----------------------------------------------------------------------------------------------------------------------------
     date_range =[datetime.now().date()]
