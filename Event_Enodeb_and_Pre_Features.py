@@ -471,8 +471,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
-    start_date_str = "2023-10-15"
-    end_date_str = "2023-11-03"
+    start_date_str = "2023-11-03"
+    end_date_str = "2023-11-05"
     date_range = get_date_range(start_date_str, end_date_str)
     #----------------------------------------------------------------------------------------------------------------------------
     date_range =[datetime.now().date()]
