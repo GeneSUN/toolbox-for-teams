@@ -54,7 +54,7 @@ def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backwar
         raise ValueError("Invalid direction argument. Use 'forward' or 'backward'.") 
     return adjusted_date.strftime(date_format)
 
-def pad_char(df, desired_length = 6   ,column_name="ENODEB"):
+def pad_six_char(df, column_name="ENODEB"):
     """ 
     Ensures that all values in the specified column have exactly 6 characters. 
     If a value has 5 characters, it adds a '0' in front of it to make it 6 characters. 
@@ -62,12 +62,11 @@ def pad_char(df, desired_length = 6   ,column_name="ENODEB"):
     :param column_name: The name of the column to process. 
     :return: The DataFrame with the specified column updated. 
     """ 
-    df_padded = df.withColumn(column_name, lpad(col(column_name), desired_length, '0')) 
-
-    return df_padded
-
-
-
+    df = df.withColumn( 
+        column_name, 
+        when(length(col(column_name)) < 6, lpad( df[column_name], 6,'0' ) ).otherwise(col(column_name)) 
+    ) 
+    return df
 def union_df_from_date_start(date_start, forward_day = 16): 
     """ 
     Union data from multiple CSV files within a date range into a single DataFrame. 
@@ -97,7 +96,7 @@ def union_df_from_date_start(date_start, forward_day = 16):
     
     df_kpis = spark.read.option("header", "true").csv("hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/rohitkovvuri/nokia_fsm_kpis_updated_v2/NokiaFSMKPIsSNAP_{}.csv".format(date_start)) 
     # Ensures that all values in 'ENODEB' column have exactly 6 characters. If a value has 5 characters, it adds a '0' in front of it
-    df_kpis = pad_char(df_kpis)
+    df_kpis = pad_six_char(df_kpis)
     
     # Check if the DataFrame columns match the provided schema
     # this step is to check if the first dataframe prepared for union is missing,
@@ -113,15 +112,13 @@ def union_df_from_date_start(date_start, forward_day = 16):
     for idate in range(1, forward_day): 
         # Calculate the date value for the current iteration, idate days before date_start 
         date_val = adjust_date(date_start, idate, "%Y-%m-%d") 
-
         try: 
             # Read the CSV file for the calculated date and remove duplicates 
             df_temp_kpi = spark.read.option("header", "true").csv("hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/rohitkovvuri/nokia_fsm_kpis_updated_v2/NokiaFSMKPIsSNAP_{}.csv".format(date_val)).dropDuplicates() 
-            df_kpis = pad_char(df_kpis)
+            df_temp_kpi = pad_six_char(df_temp_kpi)
             # Union the data from df_temp_kpi with df_kpis and apply filters 
             # After the iteration, we should get all 15-days data from date_start 
             df_kpis = df_kpis.union(df_temp_kpi.select(df_kpis.columns)).filter(~(F.col("ENODEB") == "*")).filter(F.col("ENODEB").isNotNull()) 
-
             #print(date_val,df_temp_kpi.count()) 
         except: 
             # Handle the case where data is missing for the current date_val 
@@ -130,7 +127,6 @@ def union_df_from_date_start(date_start, forward_day = 16):
     #df_kpis
     
     return df_kpis
-
 #below code is to test the performance of function 
    
 #date_td = '2023-09-19'
@@ -143,11 +139,9 @@ def convert_string_numerical(df, String_typeCols_List=['DAY', 'MMEPOOL','REGION'
     This function takes a PySpark DataFrame and a list of column names specified in 'String_typeCols_List'. 
     It casts the columns in the DataFrame to double type if they are not in the list, leaving other columns 
     as they are. 
-
     Parameters: 
     - df (DataFrame): The PySpark DataFrame to be processed. 
     - String_typeCols_List (list): A list of column names not to be cast to double. 
-
     Returns: 
     - DataFrame: A PySpark DataFrame with selected columns cast to double. 
     """ 
@@ -155,11 +149,9 @@ def convert_string_numerical(df, String_typeCols_List=['DAY', 'MMEPOOL','REGION'
     df = df.select([F.col(column).cast('double') if column not in String_typeCols_List else F.col(column) for column in df.columns]) 
     return df
 #below code is to test the performance of function
-
 #String_typeCols_List = ['DAY', 'MMEPOOL','REGION', 'MARKET', 'MARKET_DESC', 'SITE', 'ENODEB']
 #df_kpis = convert_string_numerical(df_kpis, String_typeCols_List)
 #df_kpis.dtypes
-
 def get_event_list(df_kpis):
     
     """ 
@@ -167,24 +159,18 @@ def get_event_list(df_kpis):
     that experience change from Nokia to Samsung 
     Args: 
     df_kpis (DataFrame): A PySpark DataFrame containing network performance data. including enodeb, DAY, and FSM/SEA related features
-
     Returns: 
     set: A set of 'ENODEB' values that meet the criteria. 
-
     This function performs the following steps: 
     1. Converts the 'DAY' column to a date format and computes the sum of Samsung 
        and Nokia features for each network node. 
        
     2. Filters network nodes that have Samsung data at the first date within their 
        respective time windows, indicating maintenance has already been conducted. 
-
     3. Filters network nodes where the sum of Samsung features is 0. which means the enodeb does not have maintenance the entire time window. 
-
     4. Calculates the remaining network nodes by subtracting excluded nodes from 
        the total nodes. 
-
     """ 
-
     # for simplicity, we sum up all samsung/nokia feature together.
     # since there is no negative feature. sum feature indicate which device is using.
     df = df_kpis.withColumn("DAY",F.to_date(F.col("DAY"),"MM/dd/yyyy"))\
@@ -228,20 +214,16 @@ def get_event_list(df_kpis):
     
     # Calculate the remaining 'ENODEB' values
     remain_enodeb_list = set(total_enodeb_list) - exclude_enodeb_list
-
     # Return the set of remaining 'ENODEB' values     
     return set(remain_enodeb_list)
-
 def get_enodeb_date(df,remain_enodeb_set):
     """ 
     Extract the first positive Samsung date per ENODEB from a DataFrame and return a DataFrame 
     containing the ENODEB and its corresponding first positive Samsung date. 
     The first positive Samsung data indicates the event date, because Samsung data only show up after event.
-
     :param df: The DataFrame containing the data to be filtered and processed. 
     :param remain_enodeb_set: A set of ENODEB values to filter the data. 
     :return: A DataFrame with two columns: 'enodeb_event' and 'event_date_final'. 
-
     """ 
     
     # step 1: find all the data where enodeb is in the list
@@ -263,14 +245,11 @@ def get_enodeb_date(df,remain_enodeb_set):
     ) 
     # Filter out rows with null values in 'first_positive_samsung_day' 
     result_df = result_df.filter(col('first_positive_samsung_day').isNotNull()) 
-
     # Select the resulting columns and rename them
     distinct_df = result_df.select('ENODEB','first_positive_samsung_day').distinct()
     distinct_df = distinct_df.withColumnRenamed("ENODEB", "enodeb_event").withColumnRenamed("first_positive_samsung_day", "event_date_final")
     
     return distinct_df
-
-
 def get_enodeb_features(new_event_enodeb, df_kpis):
     """ 
     Perform an inner join between the 'df_kpis' DataFrame and the 'new_event_enodeb' DataFrame 
@@ -286,7 +265,6 @@ def get_enodeb_features(new_event_enodeb, df_kpis):
     new_event_enodeb_features = df_kpis.join(broadcast_new_event_enodeb, join_condition, "inner")
     
     return new_event_enodeb_features
-
 def get_date_range(start_date_str, end_date_str): 
     """ 
     Generate a date range between the given start and end dates (inclusive). 
@@ -297,18 +275,14 @@ def get_date_range(start_date_str, end_date_str):
         list of datetime.date: A list of date objects representing the date range between 
         the start and end dates (inclusive). 
     """ 
-
     # Define the start date and end date 
     start_date = parse(start_date_str).date() 
     end_date = parse(end_date_str).date() 
-
     # Calculate the date range between the start and end dates 
     date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)] 
     return date_range 
-
 #d_r = get_date_range('2023-08-01' , '2023-08-31')
 #print(d_r[0], d_r[-1])
-
     
 def round_numeric_columns(df, decimal_places=2): 
     """ 
@@ -320,11 +294,9 @@ def round_numeric_columns(df, decimal_places=2):
     Returns: 
         DataFrame: A new PySpark DataFrame with numeric columns rounded to the specified decimal places. 
     """ 
-
     
     # List of numeric column names 
     numeric_columns = [col_name for col_name, data_type in df.dtypes if data_type == "double" or data_type == "float"] 
-
     # Apply rounding to all numeric columns 
     for col_name in numeric_columns: 
         df = df.withColumn(col_name, round(df[col_name], decimal_places)) 
@@ -350,7 +322,6 @@ def rename_FSM_features(df):
             .withColumnRenamed("from_event", "days_from_event") 
             
     return df
-
 def enodeb_mean(df, feature_list): 
     """ 
     Calculates the mean of specified features for each unique ENODEB in a PySpark DataFrame. 
@@ -362,37 +333,29 @@ def enodeb_mean(df, feature_list):
     Returns: 
         DataFrame: A new PySpark DataFrame with the mean values of the specified features for each ENODEB. 
     """ 
-
     # Define aggregate functions (calculating mean) 
     aggregate_functions = [F.avg] 
-
     # Create expressions to calculate the mean for each specified feature 
     expressions = [agg_func(F.col(col_name)).alias(col_name) for agg_func in aggregate_functions for col_name in feature_list] 
-
     # Aggregate the DataFrame by ENODEB and calculate the mean for specified features 
     # we can also use col_imp_stringcols = ['ENODEB', 'MMEPOOL','REGION','MARKET_DESC', 'SITE']
     # To be noticed. one enodeb might have two different 'REGION' (might be other features)
     df_avg_features = df.groupBy('ENODEB').agg(*expressions) 
-
     # Round the numeric columns to 2 decimal places (you can adjust as needed) 
     df_avg_features = round_numeric_columns(df_avg_features, decimal_places=2) 
-
     # Rename the columns to match the original feature names 
     df_avg_features = rename_FSM_features(df_avg_features) 
     
     columns_to_rename = df_avg_features.columns 
-
     # Iterate through columns and rename except ENODEB 
     for column in columns_to_rename: 
         if column != "ENODEB": 
             df_avg_features = df_avg_features.withColumnRenamed(column, column + "_avg") 
     
     return df_avg_features 
-
 def enodeb_stddev(df, feature_list=None): 
     """ 
     Calculates the standard deviation of specified features for each unique ENODEB in a PySpark DataFrame. 
-
     Parameters: 
         df (DataFrame): The PySpark DataFrame containing the data. 
         feature_list (list, optional): A list of feature column names to calculate the standard deviation for. 
@@ -403,46 +366,35 @@ def enodeb_stddev(df, feature_list=None):
     # Check if FSM_SIU_list is defined in the global environment 
     if "FSM_SIU_list" not in globals() and feature_list is None: 
         raise ValueError("The default feature_list, FSM_SIU_list, is not defined in the global environment.") 
-
     # If feature_list is not provided, use the predefined FSM_SIU_list (if defined) 
     if feature_list is None: 
         feature_list = globals().get("FSM_SIU_list", None) 
     # Check if feature_list is still None 
     if feature_list is None: 
         raise ValueError("feature_list is None, and FSM_SIU_list is not defined in the global environment.") 
-
     # Define aggregate functions (calculating standard deviation) 
     aggregate_functions = [F.stddev] 
-
     # Create expressions to calculate the standard deviation for each specified feature 
     expressions = [agg_func(F.col(col_name)).alias(col_name) for agg_func in aggregate_functions for col_name in feature_list] 
-
     # Aggregate the DataFrame by ENODEB and calculate the standard deviation for specified features 
     df_stddev_features = df.groupBy('ENODEB').agg(*expressions) 
-
     # Round the numeric columns to 2 decimal places (you can adjust as needed) 
     df_stddev_features = round_numeric_columns(df_stddev_features, decimal_places=2) 
-
     # Rename the columns to match the original feature names 
     df_stddev_features = rename_FSM_features(df_stddev_features)
     
     columns_to_rename = df_stddev_features.columns 
-
     # Iterate through columns and rename except ENODEB 
     for column in columns_to_rename: 
         if column != "ENODEB": 
             df_stddev_features = df_stddev_features.withColumnRenamed(column, column + "_std") 
-
     return df_stddev_features
-
 def lower_case_col_names(df,lower_case_cols_list):
     for col_name in lower_case_cols_list: 
         if col_name in df.columns: 
             df = df.withColumnRenamed(col_name, col_name.lower())
     return df
-
 def fill_allday_zero_with_NA(df, features_list):
-
     # step 1. find samples (enodeb and day) features values are all zero
     fill_zero_na_df = df.withColumn("FSM_result", reduce(add, [col(x) for x in features_list])).filter(col('FSM_result') == 0 ).select(df.columns)
     for column in features_list: 
@@ -456,10 +408,9 @@ def fill_allday_zero_with_NA(df, features_list):
     df_return = df_without_null.union(fill_zero_na_df)
     
     return df_return
-
 if __name__ == "__main__":
     # the only input is the date which is used to generate 'date_range'
-    spark = SparkSession.builder.appName('Event_Enodeb_Pre_Features').enableHiveSupport().getOrCreate()
+    spark = SparkSession.builder.appName('Pre Event').enableHiveSupport().getOrCreate()
     
     parser = argparse.ArgumentParser(description="Inputs for generating Post SNA Maintenance Script Trial")
     #parser.add_argument("--date", default=datetime.today().strftime('%Y%m%d'), help="Date for Wifi Scores")
@@ -468,29 +419,24 @@ if __name__ == "__main__":
     #parser.add_argument("--sh_dir", default=0, help="path to station history path")
     #parser.add_argument("--detail_dir", default=0, help="path to detailed data path")
     #parser.add_argument("--write_dir", default=0, help="path to write path")
-
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
-    start_date_str = "2023-11-03"
-    end_date_str = "2023-11-05"
+    start_date_str = "2023-09-01"
+    end_date_str = "2023-09-30"
     date_range = get_date_range(start_date_str, end_date_str)
     #----------------------------------------------------------------------------------------------------------------------------
     date_range =[datetime.now().date()]
     #----------------------------------------------------------------------------------------------------------------------------
     column_list = ['DAY', 'MMEPOOL', 'REGION', 'MARKET', 'MARKET_DESC', 'SITE', 'ENODEB', 'FSM_LTE_CtxDrop%', 'FSM_VOLTE_ERAB_QCI1_Drop%', 'FSM_LTE_CtxSF%', 'S1U_SIP_SC_CallDrop%', 'FSM_LTE_AvgRRCUsers', 'FSM_LTE_DLRLCMBytes', 'FSM_LTE_DL_BurstTputMbps', 'SEA_ContextDropRate_%', 'SEA_ERABDropRateQCI1_%', 'SEA_ContextSetupFailure_%', 'SEA_AvgRRCconnectedUsers_percell', 'SEA_TotalDLRLCLayerDataVolume_MB', 'SEA_DLUserPerceivedTput_Mbps', 'FSM_LTE_DLRLCReTx%', 'FSM_LTE_DLResidBLER%', 'SEA_DLRLCReTx_%', 'SEA_DLResidualBLER_%', 'FSM_LTE_RRCF%', 'SEA_RRCSetupFailure_%', 'FSM_LTE_DataERABDrop%', 'SEA_DefaultERABDropRate_%']
-
     FSM_list = [element for element in column_list if element[:3] == "FSM"]
     SEA_list = [element for element in column_list if element[:3] == "SEA"]
-
     FSM_SIU_list = FSM_list.copy()
     FSM_SIU_list.append("S1U_SIP_SC_CallDrop%")
-
     SEA_SIU_list = SEA_list.copy()
     SEA_SIU_list.append("S1U_SIP_SC_CallDrop%")
     # Define a list of string columns that should be cast to double 
     String_typeCols_List = ['DAY', 'MMEPOOL','REGION', 'MARKET', 'MARKET_DESC', 'SITE', 'ENODEB']
     features_list = ['sip_dc_rate', 'context_drop_rate', 'bearer_drop_voice_rate', 'bearer_setup_failure_rate', 'avgconnected_users', 'dl_data_volume', 'uptp_user_perceived_throughput', 'packet_retransmission_rate', 'packet_loss_rate', 'rrc_setup_failure', 'bearer_drop_rate']
-
     #for-loop start----------------------------------------------------------------------------------------------------------
     for date_td in date_range:
         #date_td = date_range[1] #replace by for date_td in date_range:
@@ -499,7 +445,6 @@ if __name__ == "__main__":
         
         df_kpis = union_df_from_date_start(date_start_str, forward_day = 15)
         
-
         # leave columns in String_typeCols_List as they were, cast other columns to numercial(double)
         df_kpis = convert_string_numerical(df_kpis, String_typeCols_List)
         df_kpis.cache()
@@ -539,7 +484,6 @@ if __name__ == "__main__":
         df_output_path = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/user/ZheS/Daily_KPI_14_days_pre_Event/Daily_KPI_14_days_pre_{}_event.csv".format(str(date_start))
         df_output.write.csv(df_output_path, header=True, mode="overwrite") 
         # --------------------------------------------------------------------------------------------------
-
         count_days_enodeb = new_event_enodeb_features.groupBy('ENODEB').agg(countDistinct("DAY")).orderBy('count(DAY)')
         
         # this list contains the most recent maintenance just before date_start
@@ -560,11 +504,9 @@ if __name__ == "__main__":
             spark_df = spark.createDataFrame([enodeb_maintained_dict])
             spark_df.write.mode('overwrite').json(result_path)
             #print(result_path)
-
         except Exception as e:
             print("error:{}".format(e))
             print("no event at {}".format(date_td))
-
         
         event_enodeb_avg_features = enodeb_mean(new_event_enodeb_features, FSM_SIU_list)
         event_enodeb_std_features  = enodeb_stddev(new_event_enodeb_features, FSM_SIU_list)
