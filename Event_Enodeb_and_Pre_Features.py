@@ -3,10 +3,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.functions import (from_unixtime,lpad,broadcast, sum, udf, col, abs, length, min, max, lit, avg, when, concat_ws, to_date, exp, explode,countDistinct, first,round  ) 
 from pyspark.sql.window import Window 
 from pyspark.sql import SparkSession 
-
 from datetime import datetime, timedelta, date 
 from dateutil.parser import parse
-
 import tempfile 
 import argparse 
 import time 
@@ -17,17 +15,12 @@ import pandas as pd
 import functools
 import json
 from operator import add 
-
 from functools import reduce 
 from operator import add 
-
-
 try: 
     from StringIO import StringIO  # for Python 2 
 except ImportError: 
     from io import StringIO, BytesIO  # for Python 3 
-
-
 def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backward'): 
     """ 
     Adjust a given date string by adding or subtracting a specified number of days. 
@@ -44,7 +37,6 @@ def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backwar
     Example: 
         adjust_date('2023-09-19', 5, '%Y-%m-%d', 'forward') returns '2023-09-24'. 
     """ 
-
     date = datetime.strptime(date_str, date_format) 
     if direction.lower() == 'forward': 
         adjusted_date = date + timedelta(days=del_days) 
@@ -53,7 +45,6 @@ def adjust_date(date_str, del_days, date_format = '%Y-%m-%d', direction='backwar
     else: 
         raise ValueError("Invalid direction argument. Use 'forward' or 'backward'.") 
     return adjusted_date.strftime(date_format)
-
 def pad_six_char(df, column_name="ENODEB"):
     """ 
     Ensures that all values in the specified column have exactly 6 characters. 
@@ -82,7 +73,6 @@ def union_df_from_date_start(date_start, forward_day = 16):
     (1 to 'forward_day' days before 'date_start'). For each date in the range, it reads a corresponding CSV file, removes 
     duplicate rows, and unions the data with the initial DataFrame. Filters are applied to exclude rows with 
     "ENODEB" equal to "*" and null values in the "ENODEB" column. The function returns the combined DataFrame. 
-
     Example: 
     -------- 
     # Read data starting from '2023-08-01' and union data for the next 15 days 
@@ -176,9 +166,7 @@ def get_event_list(df_kpis):
     df = df_kpis.withColumn("DAY",F.to_date(F.col("DAY"),"MM/dd/yyyy"))\
                         .withColumn("nokia", reduce(add, [col(x) for x in FSM_list]))\
                         .withColumn("samsung", reduce(add, [col(x) for x in SEA_list])) 
-    # Cache the DataFrame for performance optimization
-    df.cache()
-    df.count()
+
     #----------------------------------------------------------------------------------
     # step 1. filter enodeb have SEA data at the first date
     # Define a window specification to partition by 'ENODEB' and order by 'DAY' 
@@ -410,7 +398,7 @@ def fill_allday_zero_with_NA(df, features_list):
     return df_return
 if __name__ == "__main__":
     # the only input is the date which is used to generate 'date_range'
-    spark = SparkSession.builder.appName('Pre Event').enableHiveSupport().getOrCreate()
+    spark = SparkSession.builder.appName('Snap_Pre_Event').enableHiveSupport().getOrCreate()
     
     parser = argparse.ArgumentParser(description="Inputs for generating Post SNA Maintenance Script Trial")
     #parser.add_argument("--date", default=datetime.today().strftime('%Y%m%d'), help="Date for Wifi Scores")
@@ -447,9 +435,7 @@ if __name__ == "__main__":
         
         # leave columns in String_typeCols_List as they were, cast other columns to numercial(double)
         df_kpis = convert_string_numerical(df_kpis, String_typeCols_List)
-        df_kpis.cache()
-        df_kpis.count()
-        
+
         #rows_set = capture_eventday(df_kpis)
         remain_enodeb_set = get_event_list(df_kpis)
         
