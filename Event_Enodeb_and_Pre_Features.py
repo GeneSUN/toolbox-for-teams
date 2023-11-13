@@ -398,7 +398,7 @@ def fill_allday_zero_with_NA(df, features_list):
     return df_return
 if __name__ == "__main__":
     # the only input is the date which is used to generate 'date_range'
-    spark = SparkSession.builder.appName('Snap_Pre_Event').enableHiveSupport().getOrCreate()
+    spark = SparkSession.builder.appName('Snap_Pre_Event').config("spark.sql.adapative.enabled","true").enableHiveSupport().getOrCreate()
     
     parser = argparse.ArgumentParser(description="Inputs for generating Post SNA Maintenance Script Trial")
     #parser.add_argument("--date", default=datetime.today().strftime('%Y%m%d'), help="Date for Wifi Scores")
@@ -409,8 +409,8 @@ if __name__ == "__main__":
     #parser.add_argument("--write_dir", default=0, help="path to write path")
     args = parser.parse_args()
     # input as start_date_str and end_date_str-----------------------------------------------------------------------------------
-    start_date_str = "2023-09-01"
-    end_date_str = "2023-09-30"
+    start_date_str = "2023-11-10"
+    end_date_str = "2023-11-13"
     date_range = get_date_range(start_date_str, end_date_str)
     #----------------------------------------------------------------------------------------------------------------------------
     date_range =[datetime.now().date()]
