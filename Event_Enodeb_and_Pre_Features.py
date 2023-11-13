@@ -446,7 +446,7 @@ if __name__ == "__main__":
         # Parse the original date string '%Y-%m-%d' to '%m/%d/%Y, to match df_kpis 'DAY' format
         #original_date = datetime.strptime(date_start_str, '%Y-%m-%d') 
         formatted_date_string = date_start.strftime('%m/%d/%Y') 
-        print(formatted_date_string, date_start)
+        #print(formatted_date_string, date_start)
         
         new_event_enodeb = distinct_df.filter( col("event_date_final")==date_start_str )
         
