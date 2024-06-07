@@ -10,7 +10,7 @@ class HDFSFileAggregator:
         :param date_strings: A list of strings representing dates formatted according to the expected pattern. 
         """ 
         self.file_paths = [file_path_pattern.format(date) for date in date_strings] 
-        self.df = self.aggregate_files() 
+        #self.df = self.aggregate_files() 
 
     def read_and_process_file(self, file_path): 
         """ 
@@ -67,14 +67,12 @@ if __name__ == "__main__":
     file_path_pattern = "/user/ZheS/5g_homeScore/final_score/{}" 
     date_strings = [ ( date.today() - timedelta(i) ).strftime('%Y-%m-%d') for i in range(2,4)]
     hdfs_aggregator = HDFSFileAggregator(file_path_pattern, date_strings) 
+    hdfs_aggregator.aggregate_files().show()
+    
+    def custom_load_file(self, file_path): 
+        df = spark.read.parquet(file_path) 
+        return df.select("sn")
 
-    if hdfs_aggregator.df is not None: 
-
-        hdfs_aggregator.df.show() 
-
-    class CustomHDFSFileAggregator(HDFSFileAggregator): 
-        def load_file(self, file_path): 
-            df = self.spark.read.options(header=True, inferSchema=True).csv(file_path) 
-            df = df.filter(df['someColumn'] > 0)  # Example processing step 
-
-            return df 
+    import types
+    hdfs_aggregator.load_file = types.MethodType(custom_load_file,hdfs_aggregator)
+    hdfs_aggregator.aggregate_files().show()
