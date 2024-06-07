@@ -1,6 +1,11 @@
 from pyspark.sql import SparkSession 
 from functools import reduce
 from datetime import datetime, timedelta, date
+from pyspark.sql import functions as F 
+from pyspark.sql.functions import ( 
+    abs, avg, broadcast, count, col, concat_ws, countDistinct, desc, exp, expr, explode, first, from_unixtime, 
+    lpad, length, lit, max, min, rand, regexp_replace, round, sum, to_date, udf, when, 
+) 
 
 class HDFSFileAggregator: 
     def __init__(self, file_path_pattern, date_strings): 
@@ -56,7 +61,40 @@ class CSVFileAggregator(HDFSFileAggregator):
         options = {'header': True, 'inferSchema': True} 
         return self.spark.read.options(**options).csv(file_path) 
 
+class daysFeature():
+    global hdfs_pd
+    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    def __init__(self, date_val):
+        self.date_val = date_val
+        self.date_str = date_val.strftime('%Y-%m-%d') 
+        self.main_path = hdfs_pd + f"/user/ZheS/wifi_score_v3/installExtenders/{self.date_str}"
+        self.feature_path = hdfs_pd + "/user/ZheS/wifi_score_v3/homeScore_dataframe/{}"
 
+        self.df_main = spark.read.parquet(self.main_path)\
+                        .select( "serial_num","date_string","before_home_score","after_home_score" )
+
+    def read_single_day_feafure(self,d_str):
+        routers = ["G3100","CR1000A","XCI55AX","ASK-NCQ1338FA","CR1000B","CR1000B","WNC-CR200A","ASK-NCQ1338","FSNO21VA","ASK-NCQ1338E"]
+        other_routers = ["FWA55V5L","FWF100V5L","ASK-NCM1100E","ASK-NCM1100"]
+        df_features = spark.read.parquet(hdfs_pd + f"/user/ZheS/wifi_score_v3/homeScore_dataframe/{d_str}")\
+                .filter( col("dg_model_indiv").isin(routers+other_routers) )\
+                .drop("mdn","cust_id","dg_model","Rou_Ext","date","dg_model_indiv")\
+                .dropDuplicates()
+
+        for c in ["num_station","poor_rssi","poor_phyrate","home_score"]:
+            df_features = df_features.withColumnRenamed( c, c + f"_{d_str}" )
+
+    def read_days_feature(self, date_val):
+        date_val = self.date_val
+        df_main = self.df_main
+
+        date_range = [ ( date_val - timedelta(i) ).strftime('%Y-%m-%d') for i in range(1,8) ]
+        dfs = list(map(self.read_single_day_feafure(), date_range)) 
+        dfs= list(filter(None, dfs)) 
+        result_df = reduce(lambda df1, df2: df1.join(df2,"serial_num"), dfs) 
+
+        return df_main.join(result_df,"serial_num")
+    
 
 if __name__ == "__main__":
 
@@ -68,7 +106,7 @@ if __name__ == "__main__":
     date_strings = [ ( date.today() - timedelta(i) ).strftime('%Y-%m-%d') for i in range(2,4)]
     hdfs_aggregator = HDFSFileAggregator(file_path_pattern, date_strings) 
     hdfs_aggregator.aggregate_files().show()
-    
+
     def custom_load_file(self, file_path): 
         df = spark.read.parquet(file_path) 
         return df.select("sn")
