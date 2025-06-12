@@ -72,6 +72,58 @@ class HDFSFileToPulsar:
             client.close()
         return True
 
+class SparkToPulsar: 
+
+    def __init__(self, file_path, pulsar_topic, vmb_host): 
+        self.spark = SparkSession.builder.appName('VMB-wifi-score').getOrCreate()
+        self.file_path = file_path 
+        self.pulsar_topic = pulsar_topic 
+        self.vmb_host = vmb_host 
+        self.main_path = "/usr/apps/vmas/cert/cktv/"
+        self.cert_path = self.main_path + "cktv.cert.pem"
+        self.key_path = self.main_path + "cktv.key-pk8.pem"
+        self.ca_path = self.main_path + "ca.cert.pem"
+
+    def read_data(self): 
+        
+        df = self.spark.read.parquet(self.file_path) 
+        return df 
+ 
+    def process_data(self, df): 
+
+        return df 
+
+    def write_data(self, df): 
+
+        df.write.format("pulsar")\
+            .option("service.url", self.vmb_host)\
+            .option("pulsar.client.authPluginClassName","org.apache.pulsar.client.impl.auth.AuthenticationTls")\
+            .option("pulsar.client.authParams",f"tlsCertFile:{self.cert_path},tlsKeyFile:{self.key_path}")\
+            .option("pulsar.client.tlsTrustCertsFilePath",self.ca_path)\
+            .option("pulsar.client.useTls","true")\
+            .option("pulsar.client.tlsAllowInsecureConnection","false")\
+            .option("pulsar.client.tlsHostnameVerificationenable","false")\
+            .option("topic", self.pulsar_topic)\
+            .save()
+
+    def run(self): 
+        df = self.read_data()
+        df = self.process_data(df) 
+        df.show()
+        self.write_data(df) 
+
+    def consume_data(self):
+        from Pulsar_Class import PulsarJob
+        job_nonprod = PulsarJob( self.pulsar_topic ,
+                                    self.vmb_host, 
+                                    self.cert_path , 
+                                    self.key_path, 
+                                    self.ca_path
+                                )
+        data = job_nonprod.setup_consumer()
+
+        return data
+
 # --- Usage Example ---
 
 if __name__ == "__main__":
