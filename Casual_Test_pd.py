@@ -425,9 +425,9 @@ def unpivot_wide_to_long(df, time_col, feature_cols):
 
 if __name__ == "__main__":
     hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    #                                .config("spark.sql.shuffle.partitions", 3000)\
     spark = SparkSession.builder.appName('kdeDetectionPipeline_zhe')\
                                 .config("spark.sql.adapative.enabled","true")\
-                                .config("spark.sql.shuffle.partitions", 3000)\
                                 .getOrCreate()
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
