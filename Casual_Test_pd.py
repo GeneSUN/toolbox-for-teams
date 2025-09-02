@@ -1,10 +1,40 @@
+# =============================
+# Standard Python Libraries
+# =============================
+import time
+from datetime import date, timedelta
+from functools import reduce
+from typing import List
 
-# -----------------------------
+# =============================
+# Third-Party Libraries
+# =============================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KernelDensity
+
+# =============================
+# PySpark Libraries
+# =============================
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.functions import (
+    col, lag, last, lit, row_number, when
+)
+from pyspark.sql.types import (
+    BooleanType, DoubleType, FloatType, StringType,
+    StructField, StructType, TimestampType
+)
+from pyspark.sql.window import Window
+
+
+# =============================
 # Config
-# -----------------------------
-
+# =============================
 hdfs_namenode = 'hdfs://njbbepapa1.nss.vzwnet.com:9000'
 base_dir = "/user/kovvuve/owl_history_v3/date="
+TIME_COL = "time"
 
 feature_groups = {
     "signal_quality": ["4GRSRP", "4GRSRQ", "SNR", "4GSignal", "BRSRP", "RSRQ", "5GSNR", "CQI"],
@@ -17,22 +47,21 @@ feature_groups = {
     ],
 }
 ALL_FEATURES = feature_groups["signal_quality"] + feature_groups["throughput_data"]
-TIME_COL = "time"    
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.neighbors import KernelDensity
+
+# ======================================================================
+# Classes / Functions (kept identical in content; only ordering changed)
+# ======================================================================
 
 class FeaturewiseKDENoveltyDetector:
-    def __init__(self, 
-                 df, 
-                 feature_col="avg_4gsnr", 
-                 time_col="hour", 
+    def __init__(self,
+                 df,
+                 feature_col="avg_4gsnr",
+                 time_col="hour",
                  bandwidth=0.5,
-                 train_idx="all", 
-                 new_idx="all", 
-                 filter_percentile=100, 
+                 train_idx="all",
+                 new_idx="all",
+                 filter_percentile=100,
                  threshold_percentile=99,
                  anomaly_direction="low"):
         """
@@ -46,7 +75,6 @@ class FeaturewiseKDENoveltyDetector:
             filter_percentile (float): Percentile for filtering out high-end outliers in training set.
             threshold_percentile (float): Percentile to apply directional outlier threshold.
             anomaly_direction (str): One of {"both", "high", "low"} to control direction of anomaly detection.
-        
         Example Usage:
         detector = FeaturewiseKDENoveltyDetector(
                                                 df=your_df,
@@ -77,7 +105,6 @@ class FeaturewiseKDENoveltyDetector:
         """
         Filters training data by removing extreme values from both directions
         based on filter_percentile.
-        
         If filter_percentile < 100:
             - Keeps the central filter_percentile% of the data.
             - Example: 95 keeps 2.5% on each tail removed.
@@ -85,12 +112,10 @@ class FeaturewiseKDENoveltyDetector:
         if self.filter_percentile < 100:
             lower_p = (100 - self.filter_percentile) / 2
             upper_p = 100 - lower_p
-            
             lower = np.percentile(train_df[self.feature_col], lower_p)
             upper = np.percentile(train_df[self.feature_col], upper_p)
-            
             train_df = train_df[
-                (train_df[self.feature_col] >= lower) & 
+                (train_df[self.feature_col] >= lower) &
                 (train_df[self.feature_col] <= upper)
             ]
         return train_df
@@ -147,32 +172,13 @@ class FeaturewiseKDENoveltyDetector:
         return self.df[self.df["is_outlier"]][["sn", self.time_col, self.feature_col, "is_outlier"]]
 
 
-from datetime import date, timedelta
-from functools import reduce
-from typing import List
-import time
-
-import pandas as pd
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, TimestampType, FloatType, DoubleType,BooleanType
-)
-
-from pyspark.sql.window import Window
-from pyspark.sql.functions import row_number, col
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
 def convert_string_numerical(
-    df: DataFrame, 
-    cols_to_cast: List[str], 
+    df: DataFrame,
+    cols_to_cast: List[str],
     decimal_places: int = 2
 ) -> DataFrame:
     """
-    Casts selected columns to DoubleType and rounds them to a specified 
+    Casts selected columns to DoubleType and rounds them to a specified
     number of decimal places.
 
     Args:
@@ -187,12 +193,10 @@ def convert_string_numerical(
         if c in df.columns:
 
             df = df.withColumn(
-                c, 
+                c,
                 F.round(F.col(c).cast(DoubleType()), decimal_places)
             )
     return df
-
-from pyspark.sql.functions import col, lag, when, lit, last
 
 
 class HourlyIncrementProcessor:
@@ -310,74 +314,6 @@ class HourlyIncrementProcessor:
         return self
 
 
-import pandas as pd
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType, FloatType, BooleanType
-
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType, FloatType, BooleanType
-import pandas as pd
-import numpy as np
-
-# 1) Schema for the Pandas UDF output
-anomaly_schema = StructType([
-    StructField("sn", StringType(), True),
-    StructField("time", TimestampType(), True),
-    StructField("feature", StringType(), True),
-    StructField("value", FloatType(), True),
-    StructField("is_outlier", BooleanType(), True),
-])
-
-# 2) Pandas UDF (per (sn, feature) group)
-def kde_detect_pdf(pdf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expects columns: sn, time, feature, value
-    Returns ONLY the anomalous rows for this (sn, feature) group.
-    """
-    # Ensure dtypes
-    pdf = pdf.copy()
-    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
-    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
-
-    # Sort by time
-    pdf = pdf.sort_values("time").reset_index(drop=True)
-
-    # Too few points → nothing to return
-    if len(pdf) < 10:
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-    try:
-        det = FeaturewiseKDENoveltyDetector(
-            df=pdf,
-            feature_col="value",
-            time_col="time",
-            train_idx="all",
-            new_idx=slice(-1, None),           
-            filter_percentile=99,
-            threshold_percentile=95,
-            anomaly_direction="low",
-        )
-        out = det.fit()  # returns only anomalies: ['sn','time','value','is_outlier']
-
-        if out.empty:
-            return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-        # Add 'feature' back and ensure column order
-        out = out.merge(pdf[["sn", "time", "feature", "value"]], on=["sn", "time", "value"], how="left")
-        out = out[["sn", "time", "feature", "value", "is_outlier"]]
-        return out
-
-    except Exception:
-        # On error, return empty (schema-compatible)
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-
-from pyspark.sql import DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-from typing import List
-
 def forward_fill(df: DataFrame, cols_to_process: List[str], partition_col: str, order_col: str) -> DataFrame:
     """
     Performs a forward fill on specified columns of a PySpark DataFrame.
@@ -393,10 +329,8 @@ def forward_fill(df: DataFrame, cols_to_process: List[str], partition_col: str, 
     """
     window_spec = Window.partitionBy(partition_col).orderBy(order_col) \
                         .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    
     # Calculate the mean of each column to use as a fallback value
     mean_values = df.select([F.mean(col_name).alias(f"mean_{col_name}") for col_name in cols_to_process]).first()
-    
     for col_name in cols_to_process:
         # Step 1: Replace 0 with nulls
         df = df.withColumn(
@@ -411,8 +345,8 @@ def forward_fill(df: DataFrame, cols_to_process: List[str], partition_col: str, 
         # Step 3: Fill any remaining nulls (e.g., at the beginning of the partition) with the mean
         if mean_values is not None and mean_values[f"mean_{col_name}"] is not None:
             df = df.fillna({col_name: mean_values[f"mean_{col_name}"]})
-        
     return df
+
 
 def unpivot_wide_to_long(df, time_col, feature_cols):
     # Build a stack(expr) for unpivot: (feature, value)
@@ -423,51 +357,111 @@ def unpivot_wide_to_long(df, time_col, feature_cols):
     )
     return df.select("sn", time_col, F.expr(expr))
 
+
+# =============================
+# UDF Schema + Pandas UDF
+# =============================
+anomaly_schema = StructType([
+    StructField("sn", StringType(), True),
+    StructField("time", TimestampType(), True),
+    StructField("feature", StringType(), True),
+    StructField("value", FloatType(), True),
+    StructField("is_outlier", BooleanType(), True),
+])
+
+def kde_detect_pdf(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expects columns: sn, time, feature, value
+    Returns ONLY the anomalous rows for this (sn, feature) group.
+    """
+    pdf = pdf.copy()
+    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
+    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
+
+    pdf = pdf.sort_values("time").reset_index(drop=True)
+
+    if len(pdf) < 10:
+        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+    try:
+        det = FeaturewiseKDENoveltyDetector(
+            df=pdf,
+            feature_col="value",
+            time_col="time",
+            train_idx="all",
+            new_idx=slice(-1, None),
+            filter_percentile=99,
+            threshold_percentile=95,
+            anomaly_direction="low",
+        )
+        out = det.fit()
+        if out.empty:
+            return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+        # Add 'feature' back and ensure column order
+        out = out.merge(pdf[["sn", "time", "feature", "value"]], on=["sn", "time", "value"], how="left")
+        out = out[["sn", "time", "feature", "value", "is_outlier"]]
+        return out
+
+    except Exception:
+        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+
+# =============================
+# Main
+# =============================
 if __name__ == "__main__":
-    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
-    #                                .config("spark.sql.shuffle.partitions", 3000)\
-    spark = SparkSession.builder.appName('kdeDetectionPipeline_zhe')\
-                                .config("spark.sql.adapative.enabled","true")\
-                                .getOrCreate()
+    # Spark
+    spark = (
+        SparkSession.builder
+        .appName('kdeDetectionPipeline_zhe')
+        .config("spark.sql.adapative.enabled", "true")
+        .getOrCreate()
+    )
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
-
-
     start_time = time.perf_counter()
-    
 
-    # Build list of HDFS paths and read once
+# 1. Ingest
     file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=4)).strftime('%Y-%m-%d')
-    
     model_name = "ASK-NCM1100"
-    df = spark.read.option("header", "true").csv(file_path)\
-                                .withColumnRenamed("mdn", "MDN")\
-                                .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))\
-                                .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))\
-                                .select(["sn", "MDN", TIME_COL] + ALL_FEATURES)\
-                                .dropDuplicates()\
-                                #.filter( col("ModelName")==model_name )
 
-    # Preprocess
+    df = (
+        spark.read.option("header", "true").csv(file_path)
+        .withColumnRenamed("mdn", "MDN")
+        .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))
+        .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))
+        .select(["sn", "MDN", TIME_COL] + ALL_FEATURES)
+        .dropDuplicates()
+        .filter(col("ModelName") == model_name)  # Include ModelName in select() above if you enable this
+    )
+
+# 2.Preprocess
     df = convert_string_numerical(df, ALL_FEATURES)
 
-    zero_list = ["RSRQ","4GRSRQ", "4GRSRP", "BRSRP"]
-    df = forward_fill(df, zero_list , "sn", "time")
-    df = df.orderBy("sn","time")
+    zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
+    df = forward_fill(df, zero_list, "sn", "time")
+    df = df.orderBy("sn", "time")
 
-    proc = HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col = ["sn"] )\
-                    .run( steps = ('incr','log','fill') )
+        # Throughput features → hourly increments pipeline
+    proc = (
+        HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col=["sn"])
+        .run(steps=('incr', 'log', 'fill'))
+    )
     df = proc.df_hourly
 
+    # Long form for per-(sn, feature) modeling
     df_long = unpivot_wide_to_long(df, time_col=TIME_COL, feature_cols=ALL_FEATURES)
 
-    # Run anomaly detection in parallel
-    df_anomaly_all = df_long.groupBy("sn", "feature")\
-                    .applyInPandas(kde_detect_pdf, schema=anomaly_schema)
-    df_anomaly_all.write.mode("overwrite").parquet(f"/user/ZheS/owl_anomaly/test_time/kde")
+# 3. Distributed anomaly detection
+    df_anomaly_all = (
+        df_long
+        .groupBy("sn", "feature")
+        .applyInPandas(kde_detect_pdf, schema=anomaly_schema)
+    )
 
+    # Output
+    df_anomaly_all.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/test_time/kde")
 
-    end_time = time.perf_counter()
-
-    elapsed_time = end_time - start_time
+    elapsed_time = time.perf_counter() - start_time
     print(f"kde ran in {elapsed_time:.1f} seconds")
