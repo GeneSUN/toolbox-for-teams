@@ -46,7 +46,7 @@ feature_groups = {
         "TotalPacketReceived", "TotalPacketSent"
     ],
 }
-zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
+ZERO_LIST = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
 ALL_FEATURES = feature_groups["signal_quality"] + feature_groups["throughput_data"]
 
 # http://njbbvmaspd13:18080/#/notebook/2M3W7SX7Z
@@ -685,7 +685,7 @@ def groupwise_novelty_both(pdf: pd.DataFrame) -> pd.DataFrame:
             train_idx="all",
             new_idx=slice(-1, None),
             filter_percentile=99,
-            threshold_percentile=95,
+            threshold_percentile=99,
             anomaly_direction="low",
         )
         out_kde = kde.fit()[["sn","time","value","is_outlier"]].rename(
@@ -738,6 +738,7 @@ if __name__ == "__main__":
         .getOrCreate()
     )
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")    
+
     file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
     model_name = "ASK-NCM1100"
 
@@ -775,7 +776,7 @@ if __name__ == "__main__":
     df = convert_string_numerical(df, ALL_FEATURES)
 
     
-    df = forward_fill(df, zero_list, "sn", "time")
+    df = forward_fill(df, ZERO_LIST, "sn", "time")
     df = df.orderBy("sn", "time")
 
     # Throughput features → hourly increments pipeline
@@ -787,13 +788,14 @@ if __name__ == "__main__":
 
 
     df_slice = split_into_subseries(df, length=200, shift=1, sn_col="sn", time_col="time")
-    df_slice = df_slice.drop( *feature_groups["throughput_data"] )\
-                        .drop("sn")\
+    df_slice = df_slice.drop("sn")\
                         .withColumnRenamed("series_id", "sn")
     df_slice.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
+    """    """
     df_slice=spark.read.parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
 
-    df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=zero_list)
+    #df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=ZERO_LIST)
+    df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=ALL_FEATURES)
 
 
 #3. Distributed Modeling
