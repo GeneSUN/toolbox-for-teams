@@ -46,9 +46,10 @@ feature_groups = {
         "TotalPacketReceived", "TotalPacketSent"
     ],
 }
+zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
 ALL_FEATURES = feature_groups["signal_quality"] + feature_groups["throughput_data"]
 
-
+# http://njbbvmaspd13:18080/#/notebook/2M3W7SX7Z
 # ======================================================================
 # Classes / Functions (kept identical in content; only ordering changed)
 # ======================================================================
@@ -508,6 +509,60 @@ def unpivot_wide_to_long(df, time_col, feature_cols):
     return df.select("sn", time_col, F.expr(expr))
 
 
+def split_into_subseries(
+    df: DataFrame,
+    length: int,
+    shift: int,
+    sn_col: str = "sn",
+    time_col: str = "time",
+    id_col: str = "series_id",
+    time_fmt: str = "yyyyMMddHHmmss"
+) -> DataFrame:
+    """
+    Slice each SN's time series into overlapping windows of `length` rows,
+    advancing by `shift` rows, ordered by `time_col`.
+
+    Returns the original rows plus a new `id_col` that is the concatenation of
+    sn and the sub-series start time formatted with `time_fmt`.
+    """
+    assert length > 0 and shift > 0, "length and shift must be positive integers"
+
+    # 1) Order within each sn and assign row numbers
+    w_rn = Window.partitionBy(sn_col).orderBy(time_col)
+    df_rn = df.withColumn("rn", F.row_number().over(w_rn))
+
+    # 2) For each sn, compute max rn and generate valid window starts: 1, 1+shift, ..., <= N-length+1
+    max_rn = df_rn.groupBy(sn_col).agg(F.max("rn").alias("N"))
+    starts = (
+        max_rn
+        .withColumn(
+            "start_rn",
+            F.when(
+                F.col("N") >= F.lit(length),
+                F.expr(f"sequence(1, N - {length} + 1, {shift})")  # array of start indices
+            )
+        )
+        .select(sn_col, F.explode("start_rn").alias("start_rn"))  # one row per window start
+    )
+
+    # 3) Assign rows to windows where rn ∈ [start_rn, start_rn + length - 1]
+    df_windows = (
+        df_rn.join(starts, on=sn_col, how="inner")
+             .filter((F.col("rn") >= F.col("start_rn")) & (F.col("rn") < F.col("start_rn") + length))
+    )
+
+    # 4) Compute sub-series start time per (sn, start_rn) and build series_id
+    w_win = Window.partitionBy(sn_col, "start_rn")
+    df_windows = df_windows.withColumn("series_start_time", F.min(time_col).over(w_win))
+    df_windows = df_windows.withColumn(
+        id_col,
+        F.concat_ws("_", F.col(sn_col), F.date_format(F.col("series_start_time"), time_fmt))
+    )
+
+    # 5) Return rows annotated with the sub-series id (drop helpers)
+    return df_windows.drop("rn", "N", "start_rn", "series_start_time")
+
+
 # =============================
 # UDF Schema + Pandas UDF
 # =============================
@@ -643,7 +698,7 @@ def groupwise_novelty_both(pdf: pd.DataFrame) -> pd.DataFrame:
             feature="value",
             timestamp_col="time",
             recent_window_size=1,
-            window=200,
+            window=100,
             no_of_stds=3.0,
             n_shift=1,
             anomaly_direction="low",
@@ -672,9 +727,7 @@ def groupwise_novelty_both(pdf: pd.DataFrame) -> pd.DataFrame:
 
     except Exception:
         return pd.DataFrame(columns=["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"])
-# =============================
-# Main
-# =============================
+
 if __name__ == "__main__":
     # Spark
     spark = (
@@ -684,11 +737,7 @@ if __name__ == "__main__":
         .config("spark.sql.shuffle.partitions", 1200)\
         .getOrCreate()
     )
-    spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-
-    # =============================
-    # begin
-    # =============================
+    spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")    
     file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
     model_name = "ASK-NCM1100"
 
@@ -705,9 +754,12 @@ if __name__ == "__main__":
         
         path = f"{hdfs_namenode}/{base_dir}{date_str}/{hour_str}"
         file_paths.append(path)
+
     sn_list = ['ACR50220495', 'ACR50219952', 'ACR45123236', 'ACR50709744', 'ACR45127066', 'ACR50407638', 'ACR51109908', 'ACR52417251', 'ACR51317239', 'ACR44810858', 'ACR43301951', 'ACR43103903', 'ACR43105974', 'ACR44214489', 'ACR52212239', 'ACR44717227', 'ACR50111657', 'ACR51112474', 'ACR44000230', 'ACR52505377', 'ACR45011967', 'ACR50210814', 'ACR43712925', 'ACR44700139', 'ACR50401575', 'ACR51312404', 'ACR52605358', 'ACR50204281', 'ACR44713139', 'ACR52304552', 'ACR50705978', 'ACR44510528', 'ACR43714196', 'ACR44909542', 'ACR52301175', 'ACR44406975', 'ACR44518289', 'ACR43403518', 'ACR44902646', 'ACR44003303', 'ACR51110264', 'ACR45105556', 'ACR42006080', 'ACR52601816', 'ACR44700010', 'ACR51519291', 'ACR51701149', 'ACR43513827', 'ACR50204843', 'ACR42812887', 'ACR44700266', 'ACR50719917', 'ACR43100493', 'ACR51106604', 'ACR43310012', 'ACR51505149', 'ACR50423435', 'ACR50906565', 'ACR43109313', 'ACR44723610', 'ACR51717554', 'ACR43308279', 'ACR44715171', 'ACR45004304', 'ACR44522300', 'ACR45125537', 'ACR51314147', 'ACR44902044', 'ACR50419211', 'ACR43400537', 'ACR51508875', 'ACR50907524', 'ACR42802896', 'ACR43103268', 'ACR44516105', 'ACR44801791', 'ACR50211956', 'ACR42807055', 'ACR45122687', 'ACR51304508', 'ACR44810561', 'ACR44007959', 'ACR43511767', 'ACR45100534', 'ACR45120057', 'ACR44902278', 'ACR51315781', 'ACR42407111', 'ACR50709571', 'ACR50205333', 'ACR44810509', 'ACR50115055', 'ACR50706528', 'ACR44005591', 'ACR44701895', 'ACR50208010', 'ACR42201924', 'ACR44010952', 'ACR51506275', 'ACR44900466']
+    #sn_list = sn_list[:40]
+
     df = spark.read.option("header","true").csv(file_paths)
-    #df = spark.read.option("header", "true").csv(file_path)
+
     df = (
         df
         .withColumnRenamed("mdn", "MDN")
@@ -722,58 +774,7 @@ if __name__ == "__main__":
 # 2.Preprocess
     df = convert_string_numerical(df, ALL_FEATURES)
 
-    zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
-    df = forward_fill(df, zero_list, "sn", "time")
-    df = df.orderBy("sn", "time")
-
-    # Throughput features → hourly increments pipeline
-    proc = (
-        HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col=["sn"])
-        .run(steps=('incr', 'log', 'fill'))
-    )
-    df = proc.df_hourly
-    df.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/data/processed_ask-ncm1100_hourly_features")
-    sys.exit()
-
-    # =============================
-    # end
-    # =============================
-    start_time = time.perf_counter()
-
-# 1. Ingest
-    file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
-    model_name = "ASK-NCM1100"
-
-    now = datetime.now()
-    #now = datetime(2025, 8, 28, 10, 30, 0) # Year, Month, Day, Hour, Minute, Second
-
-    file_paths = []
-
-    for i in range(24):
-        current_hour_dt = now - timedelta(hours=i)
-        
-        date_str = current_hour_dt.strftime("%Y-%m-%d")
-        hour_str = current_hour_dt.strftime("hr=%H")
-        
-        path = f"{hdfs_namenode}/{base_dir}{date_str}/{hour_str}"
-        file_paths.append(path)
-
-    df = spark.read.option("header","true").csv(file_paths)
-    #df = spark.read.option("header", "true").csv(file_path)
-    df = (
-        df
-        .withColumnRenamed("mdn", "MDN")
-        .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))
-        .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))
-        .select(["sn", "MDN", TIME_COL] + ALL_FEATURES)
-        .dropDuplicates()
-        .filter(col("ModelName") == model_name)  # Include ModelName in select() above if you enable this
-    )
-
-# 2.Preprocess
-    df = convert_string_numerical(df, ALL_FEATURES)
-
-    zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
+    
     df = forward_fill(df, zero_list, "sn", "time")
     df = df.orderBy("sn", "time")
 
@@ -784,25 +785,22 @@ if __name__ == "__main__":
     )
     df = proc.df_hourly
 
-    # Long form for per-(sn, feature) modeling
-    df_long = unpivot_wide_to_long(df, time_col=TIME_COL, feature_cols=ALL_FEATURES)
 
-# 3. Distributed anomaly detection
-    """
-    df_anomaly_all = df_long.groupBy("sn", "feature")\
-                            .applyInPandas(groupwise_novelty_kde, schema=anomaly_schema)
- 
-    df_anomaly_all = df_long.groupBy("sn", "feature")\
-                        .applyInPandas(groupwise_novelty_ewma, schema=anomaly_schema)
-    """
-    df_long = df_long.repartition("sn","feature").persist()
-    df_anomaly_all = (df_long.groupBy("sn","feature")
-                        .applyInPandas(groupwise_novelty_both, schema=anomaly_schema_wide))
+    df_slice = split_into_subseries(df, length=200, shift=1, sn_col="sn", time_col="time")
+    df_slice = df_slice.drop( *feature_groups["throughput_data"] )\
+                        .drop("sn")\
+                        .withColumnRenamed("series_id", "sn")
+    df_slice.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
+    df_slice=spark.read.parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
+
+    df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=zero_list)
 
 
-    # Output
-    time_until_minute = now.strftime("%Y-%m-%d_%H")
-    df_anomaly_all.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/test_time/both")
+#3. Distributed Modeling
+    df_result = df_long.groupBy("sn","feature")\
+                        .applyInPandas(groupwise_novelty_both, schema=anomaly_schema_wide)
 
-    elapsed_time = time.perf_counter() - start_time
-    print(f"kde ran in {elapsed_time:.1f} seconds")
+    df_result.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/results")
+
+#sn_list = ['ACR50220495', 'ACR50219952', 'ACR45123236', 'ACR50709744', 'ACR45127066', 'ACR50407638', 'ACR51109908', 'ACR52417251', 'ACR51317239', 'ACR44810858', 'ACR43301951', 'ACR43103903', 'ACR43105974', 'ACR44214489', 'ACR52212239', 'ACR44717227', 'ACR50111657', 'ACR51112474', 'ACR44000230', 'ACR52505377', 'ACR45011967', 'ACR50210814', 'ACR43712925', 'ACR44700139', 'ACR50401575', 'ACR51312404', 'ACR52605358', 'ACR50204281', 'ACR44713139', 'ACR52304552', 'ACR50705978', 'ACR44510528', 'ACR43714196', 'ACR44909542', 'ACR52301175', 'ACR44406975', 'ACR44518289', 'ACR43403518', 'ACR44902646', 'ACR44003303', 'ACR51110264', 'ACR45105556', 'ACR42006080', 'ACR52601816', 'ACR44700010', 'ACR51519291', 'ACR51701149', 'ACR43513827', 'ACR50204843', 'ACR42812887', 'ACR44700266', 'ACR50719917', 'ACR43100493', 'ACR51106604', 'ACR43310012', 'ACR51505149', 'ACR50423435', 'ACR50906565', 'ACR43109313', 'ACR44723610', 'ACR51717554', 'ACR43308279', 'ACR44715171', 'ACR45004304', 'ACR44522300', 'ACR45125537', 'ACR51314147', 'ACR44902044', 'ACR50419211', 'ACR43400537', 'ACR51508875', 'ACR50907524', 'ACR42802896', 'ACR43103268', 'ACR44516105', 'ACR44801791', 'ACR50211956', 'ACR42807055', 'ACR45122687', 'ACR51304508', 'ACR44810561', 'ACR44007959', 'ACR43511767', 'ACR45100534', 'ACR45120057', 'ACR44902278', 'ACR51315781', 'ACR42407111', 'ACR50709571', 'ACR50205333', 'ACR44810509', 'ACR50115055', 'ACR50706528', 'ACR44005591', 'ACR44701895', 'ACR50208010', 'ACR42201924', 'ACR44010952', 'ACR51506275', 'ACR44900466']
+    
