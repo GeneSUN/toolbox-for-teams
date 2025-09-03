@@ -2,10 +2,10 @@
 # Standard Python Libraries
 # =============================
 import time
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from functools import reduce
-from typing import List
-
+from typing import List, Tuple
+import sys
 # =============================
 # Third-Party Libraries
 # =============================
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.neighbors import KernelDensity
-
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 # =============================
 # PySpark Libraries
 # =============================
@@ -172,6 +172,156 @@ class FeaturewiseKDENoveltyDetector:
         return self.df[self.df["is_outlier"]][["sn", self.time_col, self.feature_col, "is_outlier"]]
 
 
+class EWMAAnomalyDetector:
+    """
+    EWMA-based anomaly detector with optional scaling and flexible recent window evaluation.
+
+    Parameters:
+        df (pd.DataFrame): Input time series data.
+        feature (str): Target feature to detect anomalies on.
+        recent_window_size (int or str): 'all' or integer; number of recent points to evaluate in scoring.
+        window (int): Span for EWMA and rolling std.
+        no_of_stds (float): Control limit multiplier.
+        n_shift (int): Shift to prevent leakage.
+        anomaly_direction (str): One of {'both', 'high', 'low'}.
+        scaler (str or object): Optional scaler: 'standard', 'minmax', or custom scaler with fit_transform and inverse_transform.
+        min_std_ratio (float): Minimum rolling std as a ratio of |feature| to avoid near-zero std (default: 0.01).
+    """
+
+    def __init__(
+        self,
+        df,
+        feature,
+        timestamp_col="time",
+        recent_window_size="all",
+        window=100,
+        no_of_stds=3.0,
+        n_shift=1,
+        anomaly_direction="low",
+        scaler=None,
+        min_std_ratio=0.01,
+        use_weighted_std=False
+    ):
+        assert anomaly_direction in {"both", "high", "low"}
+        assert scaler in {None, "standard", "minmax"} or hasattr(scaler, "fit_transform")
+        assert isinstance(recent_window_size, (int, type(None), str))
+
+        self.df_original = df.copy()
+        self.feature = feature
+        self.timestamp_col = timestamp_col
+        self.window = window
+        self.no_of_stds = no_of_stds
+        self.n_shift = n_shift
+        self.recent_window_size = recent_window_size
+        self.anomaly_direction = anomaly_direction
+        self.df_ = None
+        self.scaler_type = scaler
+        self._scaler = None
+        self.min_std_ratio = min_std_ratio
+        self.use_weighted_std = use_weighted_std
+
+    def _apply_scaler(self, df):
+        df = df.copy()
+        if self.scaler_type is None:
+            df['feature_scaled'] = df[self.feature]
+        else:
+            if self.scaler_type == "standard":
+                self._scaler = StandardScaler()
+            elif self.scaler_type == "minmax":
+                self._scaler = MinMaxScaler()
+            else:
+                self._scaler = self.scaler_type
+            df['feature_scaled'] = self._scaler.fit_transform(df[[self.feature]])
+        return df
+
+    def _inverse_scaler(self, series):
+        if self._scaler is None:
+            return series
+        return self._scaler.inverse_transform(series.values.reshape(-1, 1)).flatten()
+
+    def _weighted_std_ewm(self, series, span):
+        """
+        Calculate exponentially weighted standard deviation.
+
+        Formula:
+            σ_w = sqrt( Σ wᵢ (xᵢ - μ_w)² / Σ wᵢ )
+
+        Where:
+            - xᵢ: input values in the rolling window
+            - wᵢ: exponential weights (more recent points have higher weight)
+            - μ_w: weighted mean = Σ wᵢ xᵢ / Σ wᵢ
+
+        Parameters:
+            series (pd.Series): Input series to compute weighted std on
+            span (int): EWMA span (same as for EMA)
+
+        Returns:
+            pd.Series: weighted std aligned with EMA
+        """
+        import numpy as np
+        alpha = 2 / (span + 1)
+        weights = np.array([(1 - alpha) ** i for i in reversed(range(span))])
+        weights /= weights.sum()
+
+        x = series.values
+        stds = []
+        for i in range(len(x)):
+            if i < span:
+                stds.append(np.nan)
+            else:
+                window = x[i - span + 1:i + 1]
+                mu_w = np.sum(weights * window)
+                var_w = np.sum(weights * (window - mu_w) ** 2)
+                stds.append(np.sqrt(var_w))
+        return pd.Series(stds, index=series.index)
+
+
+    def _add_ewma(self):
+        
+        df = self._apply_scaler(self.df_original)
+
+        target = df['feature_scaled'].shift(self.n_shift)
+        
+        df['EMA'] = target.ewm(span=self.window, adjust=False).mean()
+        if self.use_weighted_std:
+            df['rolling_std'] = self._weighted_std_ewm(target, span=self.window)
+        else:
+            df['rolling_std'] = target.rolling(window=self.window).std()
+        
+        # Impose a lower bound on std to avoid degenerate control limits
+        min_std = self.min_std_ratio * df['feature_scaled'].abs()
+        df['rolling_std'] = df['rolling_std'].where(df['rolling_std'] >= min_std, min_std)
+
+        df['UCL'] = df['EMA'] + self.no_of_stds * df['rolling_std']
+        df['LCL'] = df['EMA'] - self.no_of_stds * df['rolling_std']
+        
+        return df
+
+    def _detect_anomalies(self, df):
+        if self.anomaly_direction == "high":
+            df['is_outlier'] = df['feature_scaled'] > df['UCL']
+        elif self.anomaly_direction == "low":
+            df['is_outlier'] = df['feature_scaled'] < df['LCL']
+        else:
+            df['is_outlier'] = (df['feature_scaled'] > df['UCL']) | (df['feature_scaled'] < df['LCL'])
+        
+        df.loc[df.index[:self.window], 'is_outlier'] = False
+        
+        return df
+
+    def fit(self):
+        df = self._add_ewma()
+        df = self._detect_anomalies(df)
+        df_clean = df.dropna(subset=["EMA", "UCL", "LCL", "feature_scaled"])
+
+        if self.recent_window_size in [None, "all"]:
+            recent_df = df_clean
+        else:
+            recent_df = df_clean.tail(self.recent_window_size)
+
+        self.df_ = df
+        return recent_df[recent_df["is_outlier"]][["sn", self.timestamp_col, self.feature, "is_outlier"]]
+    
 def convert_string_numerical(
     df: DataFrame,
     cols_to_cast: List[str],
@@ -369,7 +519,17 @@ anomaly_schema = StructType([
     StructField("is_outlier", BooleanType(), True),
 ])
 
-def kde_detect_pdf(pdf: pd.DataFrame) -> pd.DataFrame:
+anomaly_schema_wide = StructType([
+    StructField("sn", StringType(), True),
+    StructField("time", TimestampType(), True),
+    StructField("feature", StringType(), True),
+    StructField("value", FloatType(), True),
+    StructField("is_outlier_kde", BooleanType(), True),
+    StructField("is_outlier_ewma", BooleanType(), True),
+])
+
+
+def groupwise_novelty_kde(pdf: pd.DataFrame) -> pd.DataFrame:
     """
     Expects columns: sn, time, feature, value
     Returns ONLY the anomalous rows for this (sn, feature) group.
@@ -407,6 +567,111 @@ def kde_detect_pdf(pdf: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
 
 
+def groupwise_novelty_ewma(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expects columns: sn, time, feature, value
+    Returns ONLY the anomalous rows for this (sn, feature) group.
+    """
+    pdf = pdf.copy()
+    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
+    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
+
+    pdf = pdf.sort_values("time").reset_index(drop=True)
+
+    if len(pdf) < 10:
+        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+    try:
+        detector = EWMAAnomalyDetector(
+            df=pdf,
+            feature="value",
+            timestamp_col="time",
+            recent_window_size=1,
+            window=200,
+            no_of_stds=3.0,
+            n_shift=1,
+            anomaly_direction="low",
+            scaler=None,
+            min_std_ratio=0.01,
+            use_weighted_std=False,
+        )
+        out = detector.fit()
+        if out.empty:
+            return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+        # Add 'feature' back and ensure column order
+        out = out.merge(pdf[["sn", "time", "feature", "value"]], on=["sn", "time", "value"], how="left")
+        out = out[["sn", "time", "feature", "value", "is_outlier"]]
+        return out
+
+    except Exception:
+        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
+
+
+def groupwise_novelty_both(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply both KDE and EWMA novelty detectors to a single (sn, feature) group.
+    Returns only rows where at least one detector marks the observation as an outlier.
+    """
+    pdf = pdf.copy()
+    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
+    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
+    pdf = pdf.sort_values("time").reset_index(drop=True)
+
+    if len(pdf) < 10:
+        return pd.DataFrame(columns=["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"])
+
+    try:
+        # KDE detector
+        kde = FeaturewiseKDENoveltyDetector(
+            df=pdf,
+            feature_col="value",
+            time_col="time",
+            train_idx="all",
+            new_idx=slice(-1, None),
+            filter_percentile=99,
+            threshold_percentile=95,
+            anomaly_direction="low",
+        )
+        out_kde = kde.fit()[["sn","time","value","is_outlier"]].rename(
+            columns={"is_outlier":"is_outlier_kde"}
+        )
+
+        # EWMA detector
+        ewma = EWMAAnomalyDetector(
+            df=pdf,
+            feature="value",
+            timestamp_col="time",
+            recent_window_size=1,
+            window=200,
+            no_of_stds=3.0,
+            n_shift=1,
+            anomaly_direction="low",
+            scaler=None,
+            min_std_ratio=0.01,
+            use_weighted_std=False,
+        )
+        out_ewma = ewma.fit()[["sn","time","value","is_outlier"]].rename(
+            columns={"is_outlier":"is_outlier_ewma"}
+        )
+
+        # Join results
+        base = pdf[["sn","time","feature","value"]]
+        out = (
+            base.merge(out_kde, on=["sn","time","value"], how="left")
+                .merge(out_ewma, on=["sn","time","value"], how="left")
+        )
+
+        out[["is_outlier_kde","is_outlier_ewma"]] = (
+            out[["is_outlier_kde","is_outlier_ewma"]].fillna(False)
+        )
+
+        out = out[(out["is_outlier_kde"]) | (out["is_outlier_ewma"])]
+
+        return out[["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"]]
+
+    except Exception:
+        return pd.DataFrame(columns=["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"])
 # =============================
 # Main
 # =============================
@@ -416,18 +681,87 @@ if __name__ == "__main__":
         SparkSession.builder
         .appName('kdeDetectionPipeline_zhe')
         .config("spark.sql.adapative.enabled", "true")
+        .config("spark.sql.shuffle.partitions", 1200)\
         .getOrCreate()
     )
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
+    # =============================
+    # begin
+    # =============================
+    file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
+    model_name = "ASK-NCM1100"
+
+    now = datetime.now()
+    #now = datetime(2025, 8, 28, 10, 30, 0) # Year, Month, Day, Hour, Minute, Second
+
+    file_paths = []
+
+    for i in range(200):
+        current_hour_dt = now - timedelta(hours=i)
+        
+        date_str = current_hour_dt.strftime("%Y-%m-%d")
+        hour_str = current_hour_dt.strftime("hr=%H")
+        
+        path = f"{hdfs_namenode}/{base_dir}{date_str}/{hour_str}"
+        file_paths.append(path)
+    sn_list = ['ACR50220495', 'ACR50219952', 'ACR45123236', 'ACR50709744', 'ACR45127066', 'ACR50407638', 'ACR51109908', 'ACR52417251', 'ACR51317239', 'ACR44810858', 'ACR43301951', 'ACR43103903', 'ACR43105974', 'ACR44214489', 'ACR52212239', 'ACR44717227', 'ACR50111657', 'ACR51112474', 'ACR44000230', 'ACR52505377', 'ACR45011967', 'ACR50210814', 'ACR43712925', 'ACR44700139', 'ACR50401575', 'ACR51312404', 'ACR52605358', 'ACR50204281', 'ACR44713139', 'ACR52304552', 'ACR50705978', 'ACR44510528', 'ACR43714196', 'ACR44909542', 'ACR52301175', 'ACR44406975', 'ACR44518289', 'ACR43403518', 'ACR44902646', 'ACR44003303', 'ACR51110264', 'ACR45105556', 'ACR42006080', 'ACR52601816', 'ACR44700010', 'ACR51519291', 'ACR51701149', 'ACR43513827', 'ACR50204843', 'ACR42812887', 'ACR44700266', 'ACR50719917', 'ACR43100493', 'ACR51106604', 'ACR43310012', 'ACR51505149', 'ACR50423435', 'ACR50906565', 'ACR43109313', 'ACR44723610', 'ACR51717554', 'ACR43308279', 'ACR44715171', 'ACR45004304', 'ACR44522300', 'ACR45125537', 'ACR51314147', 'ACR44902044', 'ACR50419211', 'ACR43400537', 'ACR51508875', 'ACR50907524', 'ACR42802896', 'ACR43103268', 'ACR44516105', 'ACR44801791', 'ACR50211956', 'ACR42807055', 'ACR45122687', 'ACR51304508', 'ACR44810561', 'ACR44007959', 'ACR43511767', 'ACR45100534', 'ACR45120057', 'ACR44902278', 'ACR51315781', 'ACR42407111', 'ACR50709571', 'ACR50205333', 'ACR44810509', 'ACR50115055', 'ACR50706528', 'ACR44005591', 'ACR44701895', 'ACR50208010', 'ACR42201924', 'ACR44010952', 'ACR51506275', 'ACR44900466']
+    df = spark.read.option("header","true").csv(file_paths)
+    #df = spark.read.option("header", "true").csv(file_path)
+    df = (
+        df
+        .withColumnRenamed("mdn", "MDN")
+        .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))
+        .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))
+        .select(["sn", "MDN", TIME_COL] + ALL_FEATURES)
+        .dropDuplicates()
+        .filter( col("sn").isin(sn_list) )
+        .filter(col("ModelName") == model_name)  # Include ModelName in select() above if you enable this
+    )
+
+# 2.Preprocess
+    df = convert_string_numerical(df, ALL_FEATURES)
+
+    zero_list = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
+    df = forward_fill(df, zero_list, "sn", "time")
+    df = df.orderBy("sn", "time")
+
+    # Throughput features → hourly increments pipeline
+    proc = (
+        HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col=["sn"])
+        .run(steps=('incr', 'log', 'fill'))
+    )
+    df = proc.df_hourly
+    df.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/data/processed_ask-ncm1100_hourly_features")
+    sys.exit()
+
+    # =============================
+    # end
+    # =============================
     start_time = time.perf_counter()
 
 # 1. Ingest
-    file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=4)).strftime('%Y-%m-%d')
+    file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
     model_name = "ASK-NCM1100"
 
+    now = datetime.now()
+    #now = datetime(2025, 8, 28, 10, 30, 0) # Year, Month, Day, Hour, Minute, Second
+
+    file_paths = []
+
+    for i in range(24):
+        current_hour_dt = now - timedelta(hours=i)
+        
+        date_str = current_hour_dt.strftime("%Y-%m-%d")
+        hour_str = current_hour_dt.strftime("hr=%H")
+        
+        path = f"{hdfs_namenode}/{base_dir}{date_str}/{hour_str}"
+        file_paths.append(path)
+
+    df = spark.read.option("header","true").csv(file_paths)
+    #df = spark.read.option("header", "true").csv(file_path)
     df = (
-        spark.read.option("header", "true").csv(file_path)
+        df
         .withColumnRenamed("mdn", "MDN")
         .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))
         .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))
@@ -443,7 +777,7 @@ if __name__ == "__main__":
     df = forward_fill(df, zero_list, "sn", "time")
     df = df.orderBy("sn", "time")
 
-        # Throughput features → hourly increments pipeline
+    # Throughput features → hourly increments pipeline
     proc = (
         HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col=["sn"])
         .run(steps=('incr', 'log', 'fill'))
@@ -454,14 +788,21 @@ if __name__ == "__main__":
     df_long = unpivot_wide_to_long(df, time_col=TIME_COL, feature_cols=ALL_FEATURES)
 
 # 3. Distributed anomaly detection
-    df_anomaly_all = (
-        df_long
-        .groupBy("sn", "feature")
-        .applyInPandas(kde_detect_pdf, schema=anomaly_schema)
-    )
+    """
+    df_anomaly_all = df_long.groupBy("sn", "feature")\
+                            .applyInPandas(groupwise_novelty_kde, schema=anomaly_schema)
+ 
+    df_anomaly_all = df_long.groupBy("sn", "feature")\
+                        .applyInPandas(groupwise_novelty_ewma, schema=anomaly_schema)
+    """
+    df_long = df_long.repartition("sn","feature").persist()
+    df_anomaly_all = (df_long.groupBy("sn","feature")
+                        .applyInPandas(groupwise_novelty_both, schema=anomaly_schema_wide))
+
 
     # Output
-    df_anomaly_all.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/test_time/kde")
+    time_until_minute = now.strftime("%Y-%m-%d_%H")
+    df_anomaly_all.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/test_time/both")
 
     elapsed_time = time.perf_counter() - start_time
     print(f"kde ran in {elapsed_time:.1f} seconds")
