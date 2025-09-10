@@ -1,808 +1,637 @@
-# =============================
-# Standard Python Libraries
-# =============================
-import time
-from datetime import date, timedelta, datetime
-from functools import reduce
-from typing import List, Tuple
-import sys
-# =============================
-# Third-Party Libraries
-# =============================
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.neighbors import KernelDensity
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-# =============================
-# PySpark Libraries
-# =============================
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql.functions import (
-    col, lag, last, lit, row_number, when
-)
-from pyspark.sql.types import (
-    BooleanType, DoubleType, FloatType, StringType,
-    StructField, StructType, TimestampType
-)
+from datetime import datetime, timedelta, date
 from pyspark.sql.window import Window
+from pyspark.sql.functions import sum,from_json, lag, col, split, concat_ws, lit ,udf,count, max,lit,avg, when,concat_ws,percentile_approx,explode
+from pyspark.sql.functions import udf 
+from pyspark.sql.types import FloatType
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, BooleanType
+import numpy as np
+import traceback
+import sys 
+sys.path.append('/usr/apps/vmas/scripts/ZS') 
+from MailSender import MailSender
+import argparse 
+from functools import reduce
 
+schema = StructType([
+    StructField("MDN", StringType(), True),
+    StructField("SIMState", IntegerType(), True),
+    StructField("IMSI", StringType(), True),
+    StructField("IMEI", StringType(), True),
+    StructField("SwV", StringType(), True),
+    StructField("Status", BooleanType(), True),
+    StructField("5GUptimeTimestamp", StringType(), True),
+    StructField("5GDowntimeTimestamp", StringType(), True),
+    StructField("B1MeasurementConfigurationStatus", BooleanType(), True),
+    StructField("B1MeasurementConfigurationBands", StringType(), True),
+    StructField("SNR", StringType(), True),
+    StructField("CurrentNetwork", StringType(), True),
+    StructField("HomeRoam", StringType(), True),
+    StructField("MCC", StringType(), True),
+    StructField("MNC", StringType(), True),
+    StructField("CellID", IntegerType(), True),
+    StructField("PCellID", StringType(), True),
+    StructField("TotalBytesReceived", IntegerType(), True),
+    StructField("TotalBytesSent", IntegerType(), True),
+    StructField("TotalPacketReceived", IntegerType(), True),
+    StructField("TotalPacketSent", IntegerType(), True),
+    StructField("MCS", StringType(), True),
+    StructField("PathLoss", IntegerType(), True),
+    StructField("BRSRP", DoubleType(), True),
+    StructField("EARFCN_DL", IntegerType(), True),
+    StructField("EARFCN_UL", IntegerType(), True),
+    StructField("5GEARFCN_DL", StringType(), True),
+    StructField("5GEARFCN_UL", StringType(), True),
+    StructField("PUCCH_TX_PWR", DoubleType(), True),
+    StructField("CQI", IntegerType(), True),
+    StructField("Rank", IntegerType(), True),
+    StructField("MaxMTUSize", IntegerType(), True),
+    StructField("LTERadioLinkFailureCount", IntegerType(), True),
+    StructField("LTERACHAttemptCount", IntegerType(), True),
+    StructField("LTERACHFailureCount", IntegerType(), True),
+    StructField("RRCConnectTime", StringType(), True),
+    StructField("RRCConnectRequestCount", IntegerType(), True),
+    StructField("RRCConnectFailureCount", IntegerType(), True),
+    StructField("NRSCGChangeCount", IntegerType(), True),
+    StructField("NRSCGChangeFailureCount", IntegerType(), True),
+    StructField("LTEHandOverAttemptCount", IntegerType(), True),
+    StructField("LTEHandOverFailureCount", IntegerType(), True),
+    StructField("LTEPDSCHThroughput", DoubleType(), True),
+    StructField("LTEPDSCHPeakThroughput", DoubleType(), True),
+    StructField("LTEPUSCHThroughput", DoubleType(), True),
+    StructField("LTEPUSCHPeakThroughput", DoubleType(), True),
+    StructField("RxPDCPBytes", IntegerType(), True),
+    StructField("TxPDCPBytes", IntegerType(), True),
+    StructField("4GRSRP", IntegerType(), True),
+    StructField("4GRSRQ", IntegerType(), True),
+    StructField("4GSignal", IntegerType(), True),
+    StructField("5GPCI", StringType(), True),
+    StructField("RSRQ", DoubleType(), True),
+    StructField("5GSNR", DoubleType(), True),
+    StructField("NRPDSCHInitBLER", IntegerType(), True),
+    StructField("NRPUSCHInitBLER", IntegerType(), True),
+    StructField("GPSEnabled", BooleanType(), True),
+    StructField("GPSAltitude", StringType(), True),
+    StructField("GPSLatitude", StringType(), True),
+    StructField("GPSLongitude", StringType(), True),
+    StructField("5GModemTempThreshold", StringType(), True),
+    StructField("5GNRSub6AntennaTempThreshold", StringType(), True),
+    StructField("4GAntennaTempThreshold", StringType(), True),
+    StructField("ModemTemp", StringType(), True),
+    StructField("5GNRSub6AntennaTemp", StringType(), True),
+    StructField("4GAntennaTemp", StringType(), True),
+    StructField("4GTempFallback", BooleanType(), True),
+    StructField("4GTempFallbackCause", IntegerType(), True),
+    StructField("5GServiceThermalDegradation", BooleanType(), True),
+    StructField("5GServiceThermalDegradationCause", IntegerType(), True),
+    StructField("ModemLoggingEnabled", BooleanType(), True),
 
-# =============================
-# Config
-# =============================
-hdfs_namenode = 'hdfs://njbbepapa1.nss.vzwnet.com:9000'
-base_dir = "/user/kovvuve/owl_history_v3/date="
-TIME_COL = "time"
+    StructField("4GPccBand", IntegerType(), True),
+    StructField("4GScc1Band", IntegerType(), True),
+    StructField("4GScc2Band", IntegerType(), True),
+    StructField("4GScc3Band", IntegerType(), True),
 
-feature_groups = {
-    "signal_quality": ["4GRSRP", "4GRSRQ", "SNR", "4GSignal", "BRSRP", "RSRQ", "5GSNR", "CQI"],
-    "throughput_data": [
-        "LTEPDSCHPeakThroughput", "LTEPDSCHThroughput",
-        "LTEPUSCHPeakThroughput", "LTEPUSCHThroughput",
-        "TxPDCPBytes", "RxPDCPBytes",
-        "TotalBytesReceived", "TotalBytesSent",
-        "TotalPacketReceived", "TotalPacketSent"
-    ],
-}
-ZERO_LIST = ["RSRQ", "4GRSRQ", "4GRSRP", "BRSRP"]
-ALL_FEATURES = feature_groups["signal_quality"] + feature_groups["throughput_data"]
+    StructField("5GPccBand", IntegerType(), True),
+    StructField("5GScc1Band", IntegerType(), True),
+    StructField("ServiceUptime", StringType(), True),
+    StructField("ServiceDowntime", StringType(), True),
+    StructField("ServiceUptimeTimestamp", StringType(), True),
+    StructField("ServiceDowntimeTimestamp", StringType(), True),
+    StructField("5GUW_Allowed", BooleanType(), True),
+    StructField("5GNRRadioLinkFailureCount", IntegerType(), True),
+    StructField("5GNRRACHAttemptCount", IntegerType(), True),
+    StructField("5GNRRACHFailureCount", IntegerType(), True),
+    StructField("5GNRRRCConnectTime", StringType(), True),
+    StructField("5GNRRRCConnectRequestCount", IntegerType(), True),
+    StructField("5GNRRRCConnectFailureCount", IntegerType(), True),
+    StructField("5GNRHandOverAttemptCount", IntegerType(), True),
+    StructField("5GNRHandOverFailureCount", IntegerType(), True),
+    StructField("5GNRPDSCHThroughput", DoubleType(), True),
+    StructField("5GNRPUSCHThroughput", DoubleType(), True),
+    StructField("5GNRPDSCHPeakThroughput", DoubleType(), True),
+    StructField("5GNRPUSCHPeakThroughput", DoubleType(), True),
+    StructField("5GNRRxPDCPBytes", IntegerType(), True),
+    StructField("5GNRTxPDCPBytes", IntegerType(), True),
+    StructField("NRSCGFailureCount", IntegerType(), True),
+    StructField("CPUUsage", StringType(), True),
+    StructField("Uptime", StringType(), True),
+    StructField("RebootCause", StringType(), True),
+    StructField("Manufacturer", StringType(), True),
+    StructField("ModelName", StringType(), True),
+    StructField("FmV", StringType(), True),
+    StructField("HwV", StringType(), True),
+    StructField("MemoryAvail", StringType(), True),
+    StructField("MemoryPercentFree", DoubleType(), True),
+    StructField("ipv4_ip", StringType(), True),
+    StructField("ipv6_ip", StringType(), True)
+])
 
-# http://njbbvmaspd13:18080/#/notebook/2M3W7SX7Z
-# ======================================================================
-# Classes / Functions (kept identical in content; only ordering changed)
-# ======================================================================
+def convert_to_numeric(df, col_name):
+    return df.withColumn(f"{col_name}_numeric", F.when(F.col(col_name) == "Poor", 1)
+                                                .when(F.col(col_name) == "Fair", 2)
+                                                .when(F.col(col_name) == "Good", 3)
+                                                .when(F.col(col_name) == "Excellent", 4)
+                                                .otherwise(None))
+def convert_to_categorical(df, col_name):
+    return df.withColumn(col_name, 
+                        F.when(F.col(col_name) < 1.5, "Poor")
+                        .when((F.col(col_name) >= 1.5) & (F.col(col_name) < 2.5), "Fair")
+                        .when((F.col(col_name) >= 2.5) & (F.col(col_name) < 3.5), "Good")
+                        .when(F.col(col_name) >= 3.5, "Excellent")
+                        .otherwise(None))
 
-class FeaturewiseKDENoveltyDetector:
-    def __init__(self,
-                 df,
-                 feature_col="avg_4gsnr",
-                 time_col="hour",
-                 bandwidth=0.5,
-                 train_idx="all",
-                 new_idx="all",
-                 filter_percentile=100,
-                 threshold_percentile=99,
-                 anomaly_direction="low"):
-        """
-        Parameters:
-            df (pd.DataFrame): Input data.
-            feature_col (str): Column containing values to evaluate.
-            time_col (str): Time column for plotting.
-            bandwidth (float): Bandwidth for KDE.
-            train_idx (slice, list, int, or "all"): Indices for training data. "all" uses the entire DataFrame.
-            new_idx (slice, list, int, or "all"): Indices for test data. "all" uses the entire DataFrame.
-            filter_percentile (float): Percentile for filtering out high-end outliers in training set.
-            threshold_percentile (float): Percentile to apply directional outlier threshold.
-            anomaly_direction (str): One of {"both", "high", "low"} to control direction of anomaly detection.
-        Example Usage:
-        detector = FeaturewiseKDENoveltyDetector(
-                                                df=your_df,
-                                                feature_col="avg_5gsnr",
-                                                time_col="hour",
-                                                train_idx=slice(0, 1068),
-                                                new_idx=slice(-26, None),
-                                                filter_percentile = 100,
-                                                threshold_percentile=95,
-                                                anomaly_direction="both"  # can be "low", "high", or "both"
-                                                )
-        result = detector.fit()
-        """
-        self.df = df
-        self.feature_col = feature_col
-        self.time_col = time_col
-        self.bandwidth = bandwidth
-        self.train_idx = train_idx
-        self.new_idx = new_idx
-        self.filter_percentile = filter_percentile
-        self.threshold_percentile = threshold_percentile
-        self.anomaly_direction = anomaly_direction
-        self.kde = None
-        self.threshold = None
-        self.outlier_mask = None
+class ScoreCalculator: 
+    def __init__(self, weights): 
+        self.weights = weights 
+ 
+    def calculate_score(self, *args): 
+        total_weight = 0 
+        score = 0 
 
-    def _filter_train_df(self, train_df):
-        """
-        Filters training data by removing extreme values from both directions
-        based on filter_percentile.
-        If filter_percentile < 100:
-            - Keeps the central filter_percentile% of the data.
-            - Example: 95 keeps 2.5% on each tail removed.
-        """
-        if self.filter_percentile < 100:
-            lower_p = (100 - self.filter_percentile) / 2
-            upper_p = 100 - lower_p
-            lower = np.percentile(train_df[self.feature_col], lower_p)
-            upper = np.percentile(train_df[self.feature_col], upper_p)
-            train_df = train_df[
-                (train_df[self.feature_col] >= lower) &
-                (train_df[self.feature_col] <= upper)
-            ]
-        return train_df
+        for weight, value in zip(self.weights.values(), args): 
+            if value is not None: 
+                score += weight * float(value) 
+                total_weight += weight 
 
-    def fit(self):
-        # Handle "all" option for training and testing index
-        if self.train_idx == "all":
-            train_df = self.df.copy()
-        else:
-            train_df = self.df.iloc[self.train_idx]
-        train_df = self._filter_train_df(train_df)
+        return score / total_weight if total_weight != 0 else None 
 
-        if self.new_idx == "all":
-            new_df = self.df.copy()
-            new_indices = self.df.index
-        else:
-            new_df = self.df.iloc[self.new_idx]
-            new_indices = self.df.iloc[self.new_idx].index
+class CellularScore:
+    global hdfs_pa, hdfs_pd, count_features
 
-        # Fit KDE on training data
-        X_train = train_df[self.feature_col].values.reshape(-1, 1)
-        X_new = new_df[self.feature_col].values.reshape(-1, 1)
-
-        self.kde = KernelDensity(kernel='gaussian', bandwidth=self.bandwidth)
-        self.kde.fit(X_train)
-
-        # Compute densities
-        dens_train = np.exp(self.kde.score_samples(X_train))
-        self.threshold = np.quantile(dens_train, 0.01)
-
-        dens_new = np.exp(self.kde.score_samples(X_new))
-        outlier_mask_kde = dens_new < self.threshold
-
-        # Directional anomaly logic based on percentiles
-        new_values = new_df[self.feature_col].values
-        lower_threshold = np.percentile(train_df[self.feature_col], 100 - self.threshold_percentile)
-        upper_threshold = np.percentile(train_df[self.feature_col], self.threshold_percentile)
-
-        if self.anomaly_direction == "low":
-            direction_mask = new_values < lower_threshold
-        elif self.anomaly_direction == "high":
-            direction_mask = new_values > upper_threshold
-        else:  # both
-            direction_mask = (new_values < lower_threshold) | (new_values > upper_threshold)
-
-        # Final anomaly mask
-        final_outlier_mask = outlier_mask_kde & direction_mask
-        self.outlier_mask = final_outlier_mask
-
-        is_outlier_col = pd.Series(False, index=self.df.index)
-        is_outlier_col.loc[new_indices] = final_outlier_mask
-        self.df["is_outlier"] = is_outlier_col
-
-        return self.df[self.df["is_outlier"]][["sn", self.time_col, self.feature_col, "is_outlier"]]
-
-
-class EWMAAnomalyDetector:
-    """
-    EWMA-based anomaly detector with optional scaling and flexible recent window evaluation.
-
-    Parameters:
-        df (pd.DataFrame): Input time series data.
-        feature (str): Target feature to detect anomalies on.
-        recent_window_size (int or str): 'all' or integer; number of recent points to evaluate in scoring.
-        window (int): Span for EWMA and rolling std.
-        no_of_stds (float): Control limit multiplier.
-        n_shift (int): Shift to prevent leakage.
-        anomaly_direction (str): One of {'both', 'high', 'low'}.
-        scaler (str or object): Optional scaler: 'standard', 'minmax', or custom scaler with fit_transform and inverse_transform.
-        min_std_ratio (float): Minimum rolling std as a ratio of |feature| to avoid near-zero std (default: 0.01).
-    """
-
-    def __init__(
-        self,
-        df,
-        feature,
-        timestamp_col="time",
-        recent_window_size="all",
-        window=100,
-        no_of_stds=3.0,
-        n_shift=1,
-        anomaly_direction="low",
-        scaler=None,
-        min_std_ratio=0.01,
-        use_weighted_std=False
-    ):
-        assert anomaly_direction in {"both", "high", "low"}
-        assert scaler in {None, "standard", "minmax"} or hasattr(scaler, "fit_transform")
-        assert isinstance(recent_window_size, (int, type(None), str))
-
-        self.df_original = df.copy()
-        self.feature = feature
-        self.timestamp_col = timestamp_col
-        self.window = window
-        self.no_of_stds = no_of_stds
-        self.n_shift = n_shift
-        self.recent_window_size = recent_window_size
-        self.anomaly_direction = anomaly_direction
-        self.df_ = None
-        self.scaler_type = scaler
-        self._scaler = None
-        self.min_std_ratio = min_std_ratio
-        self.use_weighted_std = use_weighted_std
-
-    def _apply_scaler(self, df):
-        df = df.copy()
-        if self.scaler_type is None:
-            df['feature_scaled'] = df[self.feature]
-        else:
-            if self.scaler_type == "standard":
-                self._scaler = StandardScaler()
-            elif self.scaler_type == "minmax":
-                self._scaler = MinMaxScaler()
-            else:
-                self._scaler = self.scaler_type
-            df['feature_scaled'] = self._scaler.fit_transform(df[[self.feature]])
-        return df
-
-    def _inverse_scaler(self, series):
-        if self._scaler is None:
-            return series
-        return self._scaler.inverse_transform(series.values.reshape(-1, 1)).flatten()
-
-    def _weighted_std_ewm(self, series, span):
-        """
-        Calculate exponentially weighted standard deviation.
-
-        Formula:
-            σ_w = sqrt( Σ wᵢ (xᵢ - μ_w)² / Σ wᵢ )
-
-        Where:
-            - xᵢ: input values in the rolling window
-            - wᵢ: exponential weights (more recent points have higher weight)
-            - μ_w: weighted mean = Σ wᵢ xᵢ / Σ wᵢ
-
-        Parameters:
-            series (pd.Series): Input series to compute weighted std on
-            span (int): EWMA span (same as for EMA)
-
-        Returns:
-            pd.Series: weighted std aligned with EMA
-        """
-        import numpy as np
-        alpha = 2 / (span + 1)
-        weights = np.array([(1 - alpha) ** i for i in reversed(range(span))])
-        weights /= weights.sum()
-
-        x = series.values
-        stds = []
-        for i in range(len(x)):
-            if i < span:
-                stds.append(np.nan)
-            else:
-                window = x[i - span + 1:i + 1]
-                mu_w = np.sum(weights * window)
-                var_w = np.sum(weights * (window - mu_w) ** 2)
-                stds.append(np.sqrt(var_w))
-        return pd.Series(stds, index=series.index)
-
-
-    def _add_ewma(self):
-        
-        df = self._apply_scaler(self.df_original)
-
-        target = df['feature_scaled'].shift(self.n_shift)
-        
-        df['EMA'] = target.ewm(span=self.window, adjust=False).mean()
-        if self.use_weighted_std:
-            df['rolling_std'] = self._weighted_std_ewm(target, span=self.window)
-        else:
-            df['rolling_std'] = target.rolling(window=self.window).std()
-        
-        # Impose a lower bound on std to avoid degenerate control limits
-        min_std = self.min_std_ratio * df['feature_scaled'].abs()
-        df['rolling_std'] = df['rolling_std'].where(df['rolling_std'] >= min_std, min_std)
-
-        df['UCL'] = df['EMA'] + self.no_of_stds * df['rolling_std']
-        df['LCL'] = df['EMA'] - self.no_of_stds * df['rolling_std']
-        
-        return df
-
-    def _detect_anomalies(self, df):
-        if self.anomaly_direction == "high":
-            df['is_outlier'] = df['feature_scaled'] > df['UCL']
-        elif self.anomaly_direction == "low":
-            df['is_outlier'] = df['feature_scaled'] < df['LCL']
-        else:
-            df['is_outlier'] = (df['feature_scaled'] > df['UCL']) | (df['feature_scaled'] < df['LCL'])
-        
-        df.loc[df.index[:self.window], 'is_outlier'] = False
-        
-        return df
-
-    def fit(self):
-        df = self._add_ewma()
-        df = self._detect_anomalies(df)
-        df_clean = df.dropna(subset=["EMA", "UCL", "LCL", "feature_scaled"])
-
-        if self.recent_window_size in [None, "all"]:
-            recent_df = df_clean
-        else:
-            recent_df = df_clean.tail(self.recent_window_size)
-
-        self.df_ = df
-        return recent_df[recent_df["is_outlier"]][["sn", self.timestamp_col, self.feature, "is_outlier"]]
+    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    hdfs_pa =  'hdfs://njbbepapa1.nss.vzwnet.com:9000'
+    count_features = ["LTERACHFailureCount", "LTEHandOverFailureCount", "NRSCGChangeFailureCount","RRCConnectFailureCount"]
     
-def convert_string_numerical(
-    df: DataFrame,
-    cols_to_cast: List[str],
-    decimal_places: int = 2
-) -> DataFrame:
-    """
-    Casts selected columns to DoubleType and rounds them to a specified
-    number of decimal places.
-
-    Args:
-        df: The input PySpark DataFrame.
-        cols_to_cast: A list of column names to cast and round.
-        decimal_places: The number of decimal places to round to. Defaults to 2.
-
-    Returns:
-        A new DataFrame with the specified columns cast and rounded.
-    """
-    for c in cols_to_cast:
-        if c in df.columns:
-
-            df = df.withColumn(
-                c,
-                F.round(F.col(c).cast(DoubleType()), decimal_places)
-            )
-    return df
-
-
-class HourlyIncrementProcessor:
-    """
-    Steps:
-      - 'hourly' : hourly averages (processed columns) + carry-through of ALL other columns via FIRST()
-      - 'incr'   : replace processed features with smoothed increments
-      - 'log'    : replace processed features with log1p(increments)
-      - 'fill'   : forward-fill zeros in the (current) processed feature columns
-    Notes:
-      • All columns not listed in `columns` are preserved. During the 'hourly' aggregation,
-        they are reduced with FIRST(ignorenulls=True) within each (partition_cols, time_col) group.
-        Adjust that policy if you prefer MIN/MAX/LAST/etc.
-    """
-
-    def __init__(self, df: DataFrame, columns: List[str], partition_col=("sn",), time_col: str = TIME_COL):
-        self.df = df
-        self.columns = list(columns)
-        self.partition_cols = list(partition_col) if isinstance(partition_col, (list, tuple)) else [partition_col]
-        self.time_col = time_col
-
-        # identify carry-through columns (everything except keys + processed columns)
-        key_cols = set(self.partition_cols + [self.time_col])
-        self.other_cols = [c for c in self.df.columns if c not in self.columns and c not in key_cols]
-
-        self.df_hourly = None
-        self._done = set()
-
-    def compute_hourly_average(self):
-        # averages for processed columns
-        agg_proc = [F.round(F.avg(c), 2).alias(c) for c in self.columns]
-        # carry-through for all remaining columns (FIRST non-null within the hour)
-        agg_other = [F.first(col(c), ignorenulls=True).alias(c) for c in self.other_cols]
-
-        self.df_hourly = (
-            self.df
-            .groupBy(*self.partition_cols, self.time_col)
-            .agg(*agg_proc, *agg_other)
-        )
-        self._done.add("hourly")
-
-    def compute_increments(self, partition_cols=None, order_col=None):
-        if "hourly" not in self._done:
-            self.compute_hourly_average()
-
-        partition_cols = self.partition_cols if partition_cols is None else partition_cols
-        order_col = self.time_col if order_col is None else order_col
-        w = Window.partitionBy(*partition_cols).orderBy(order_col)
-
-        for c in self.columns:
-            prev = lag(col(c), 1).over(w)
-            raw_incr = col(c) - prev
-            prev_incr = lag(raw_incr, 1).over(w)
-
-            incr = when(col(c) < prev, when(prev_incr.isNotNull(), prev_incr).otherwise(lit(0))).otherwise(raw_incr)
-            prev_smooth = lag(incr, 1).over(w)
-            smoothed = when(incr < 0, prev_smooth).otherwise(incr)
-            self.df_hourly = self.df_hourly.withColumn(c, F.round(smoothed, 2))
-
-        # drop rows where increments are null (first row per partition)
-        self.df_hourly = self.df_hourly.na.drop(subset=self.columns)
-        self._done.add("incr")
-
-    def apply_log_transform(self):
-        if "incr" not in self._done:
-            self.compute_increments()
-
-        for c in self.columns:
-            self.df_hourly = self.df_hourly.withColumn(
-                c, F.round(F.log1p(F.when(col(c) < 0, lit(0)).otherwise(col(c))), 2)
-            )
-        self._done.add("log")
-
-    def fill_zero_with_previous(self, partition_cols=None, order_col=None):
-        if "log" not in self._done and "incr" not in self._done and "hourly" not in self._done:
-            self.compute_hourly_average()
-
-        partition_cols = self.partition_cols if partition_cols is None else partition_cols
-        order_col = self.time_col if order_col is None else order_col
-
-        w_ffill = (
-            Window.partitionBy(*partition_cols)
-            .orderBy(order_col)
-            .rowsBetween(Window.unboundedPreceding, 0)
-        )
-
-        for c in self.columns:
-            tmp = f"__{c}_nz"
-            self.df_hourly = (
-                self.df_hourly
-                .withColumn(tmp, when(col(c) != 0, col(c)))
-                .withColumn(c, last(tmp, ignorenulls=True).over(w_ffill))
-                .drop(tmp)
-            )
-        self._done.add("fill")
-
-    def run(self, steps=("hourly", "incr", "log", "fill")):
-        wanted = list(steps)
-        for step in wanted:
-            if step == "incr" and "hourly" not in self._done:
-                self.compute_hourly_average()
-            if step == "log" and "incr" not in self._done:
-                self.compute_increments()
-            if step == "fill" and not ({"hourly", "incr", "log"} & self._done):
-                self.compute_hourly_average()
-
-            if step == "hourly" and "hourly" not in self._done:
-                self.compute_hourly_average()
-            elif step == "incr" and "incr" not in self._done:
-                self.compute_increments()
-            elif step == "log" and "log" not in self._done:
-                self.apply_log_transform()
-            elif step == "fill" and "fill" not in self._done:
-                self.fill_zero_with_previous()
-        return self
-
-
-def forward_fill(df: DataFrame, cols_to_process: List[str], partition_col: str, order_col: str) -> DataFrame:
-    """
-    Performs a forward fill on specified columns of a PySpark DataFrame.
-
-    Args:
-        df (DataFrame): The input DataFrame.
-        cols_to_process (List[str]): A list of column names to apply forward fill.
-        partition_col (str): The column to partition the window by (e.g., 'sn').
-        order_col (str): The column to order the window by (e.g., 'time').
-
-    Returns:
-        DataFrame: The DataFrame with specified columns forward-filled.
-    """
-    window_spec = Window.partitionBy(partition_col).orderBy(order_col) \
-                        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    # Calculate the mean of each column to use as a fallback value
-    mean_values = df.select([F.mean(col_name).alias(f"mean_{col_name}") for col_name in cols_to_process]).first()
-    for col_name in cols_to_process:
-        # Step 1: Replace 0 with nulls
-        df = df.withColumn(
-            col_name,
-            F.when(F.col(col_name) == 0, F.lit(None)).otherwise(F.col(col_name))
-        )
-        # Step 2: Forward fill the nulls
-        df = df.withColumn(
-            col_name,
-            F.last(F.col(col_name), ignorenulls=True).over(window_spec)
-        )
-        # Step 3: Fill any remaining nulls (e.g., at the beginning of the partition) with the mean
-        if mean_values is not None and mean_values[f"mean_{col_name}"] is not None:
-            df = df.fillna({col_name: mean_values[f"mean_{col_name}"]})
-    return df
-
-
-def unpivot_wide_to_long(df, time_col, feature_cols):
-    # Build a stack(expr) for unpivot: (feature, value)
-    n = len(feature_cols)
-    expr = "stack({n}, {pairs}) as (feature, value)".format(
-        n=n,
-        pairs=", ".join([f"'{c}', `{c}`" for c in feature_cols])
-    )
-    return df.select("sn", time_col, F.expr(expr))
-
-
-def split_into_subseries(
-    df: DataFrame,
-    length: int,
-    shift: int,
-    sn_col: str = "sn",
-    time_col: str = "time",
-    id_col: str = "series_id",
-    time_fmt: str = "yyyyMMddHHmmss"
-) -> DataFrame:
-    """
-    Slice each SN's time series into overlapping windows of `length` rows,
-    advancing by `shift` rows, ordered by `time_col`.
-
-    Returns the original rows plus a new `id_col` that is the concatenation of
-    sn and the sub-series start time formatted with `time_fmt`.
-    """
-    assert length > 0 and shift > 0, "length and shift must be positive integers"
-
-    # 1) Order within each sn and assign row numbers
-    w_rn = Window.partitionBy(sn_col).orderBy(time_col)
-    df_rn = df.withColumn("rn", F.row_number().over(w_rn))
-
-    # 2) For each sn, compute max rn and generate valid window starts: 1, 1+shift, ..., <= N-length+1
-    max_rn = df_rn.groupBy(sn_col).agg(F.max("rn").alias("N"))
-    starts = (
-        max_rn
-        .withColumn(
-            "start_rn",
-            F.when(
-                F.col("N") >= F.lit(length),
-                F.expr(f"sequence(1, N - {length} + 1, {shift})")  # array of start indices
-            )
-        )
-        .select(sn_col, F.explode("start_rn").alias("start_rn"))  # one row per window start
-    )
-
-    # 3) Assign rows to windows where rn ∈ [start_rn, start_rn + length - 1]
-    df_windows = (
-        df_rn.join(starts, on=sn_col, how="inner")
-             .filter((F.col("rn") >= F.col("start_rn")) & (F.col("rn") < F.col("start_rn") + length))
-    )
-
-    # 4) Compute sub-series start time per (sn, start_rn) and build series_id
-    w_win = Window.partitionBy(sn_col, "start_rn")
-    df_windows = df_windows.withColumn("series_start_time", F.min(time_col).over(w_win))
-    df_windows = df_windows.withColumn(
-        id_col,
-        F.concat_ws("_", F.col(sn_col), F.date_format(F.col("series_start_time"), time_fmt))
-    )
-
-    # 5) Return rows annotated with the sub-series id (drop helpers)
-    return df_windows.drop("rn", "N", "start_rn", "series_start_time")
-
-
-# =============================
-# UDF Schema + Pandas UDF
-# =============================
-anomaly_schema = StructType([
-    StructField("sn", StringType(), True),
-    StructField("time", TimestampType(), True),
-    StructField("feature", StringType(), True),
-    StructField("value", FloatType(), True),
-    StructField("is_outlier", BooleanType(), True),
-])
-
-anomaly_schema_wide = StructType([
-    StructField("sn", StringType(), True),
-    StructField("time", TimestampType(), True),
-    StructField("feature", StringType(), True),
-    StructField("value", FloatType(), True),
-    StructField("is_outlier_kde", BooleanType(), True),
-    StructField("is_outlier_ewma", BooleanType(), True),
-])
-
-
-def groupwise_novelty_kde(pdf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expects columns: sn, time, feature, value
-    Returns ONLY the anomalous rows for this (sn, feature) group.
-    """
-    pdf = pdf.copy()
-    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
-    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
-
-    pdf = pdf.sort_values("time").reset_index(drop=True)
-
-    if len(pdf) < 10:
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-    try:
-        det = FeaturewiseKDENoveltyDetector(
-            df=pdf,
-            feature_col="value",
-            time_col="time",
-            train_idx="all",
-            new_idx=slice(-1, None),
-            filter_percentile=99,
-            threshold_percentile=95,
-            anomaly_direction="low",
-        )
-        out = det.fit()
-        if out.empty:
-            return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-        # Add 'feature' back and ensure column order
-        out = out.merge(pdf[["sn", "time", "feature", "value"]], on=["sn", "time", "value"], how="left")
-        out = out[["sn", "time", "feature", "value", "is_outlier"]]
-        return out
-
-    except Exception:
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-
-def groupwise_novelty_ewma(pdf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expects columns: sn, time, feature, value
-    Returns ONLY the anomalous rows for this (sn, feature) group.
-    """
-    pdf = pdf.copy()
-    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
-    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
-
-    pdf = pdf.sort_values("time").reset_index(drop=True)
-
-    if len(pdf) < 10:
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-    try:
-        detector = EWMAAnomalyDetector(
-            df=pdf,
-            feature="value",
-            timestamp_col="time",
-            recent_window_size=1,
-            window=200,
-            no_of_stds=3.0,
-            n_shift=1,
-            anomaly_direction="low",
-            scaler=None,
-            min_std_ratio=0.01,
-            use_weighted_std=False,
-        )
-        out = detector.fit()
-        if out.empty:
-            return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-        # Add 'feature' back and ensure column order
-        out = out.merge(pdf[["sn", "time", "feature", "value"]], on=["sn", "time", "value"], how="left")
-        out = out[["sn", "time", "feature", "value", "is_outlier"]]
-        return out
-
-    except Exception:
-        return pd.DataFrame(columns=["sn", "time", "feature", "value", "is_outlier"])
-
-
-def groupwise_novelty_both(pdf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply both KDE and EWMA novelty detectors to a single (sn, feature) group.
-    Returns only rows where at least one detector marks the observation as an outlier.
-    """
-    pdf = pdf.copy()
-    pdf["time"] = pd.to_datetime(pdf["time"], errors="coerce")
-    pdf["value"] = pd.to_numeric(pdf["value"], errors="coerce")
-    pdf = pdf.sort_values("time").reset_index(drop=True)
-
-    if len(pdf) < 10:
-        return pd.DataFrame(columns=["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"])
-
-    try:
-        # KDE detector
-        kde = FeaturewiseKDENoveltyDetector(
-            df=pdf,
-            feature_col="value",
-            time_col="time",
-            train_idx="all",
-            new_idx=slice(-1, None),
-            filter_percentile=99,
-            threshold_percentile=99,
-            anomaly_direction="low",
-        )
-        out_kde = kde.fit()[["sn","time","value","is_outlier"]].rename(
-            columns={"is_outlier":"is_outlier_kde"}
-        )
-
-        # EWMA detector
-        ewma = EWMAAnomalyDetector(
-            df=pdf,
-            feature="value",
-            timestamp_col="time",
-            recent_window_size=1,
-            window=100,
-            no_of_stds=3.0,
-            n_shift=1,
-            anomaly_direction="low",
-            scaler=None,
-            min_std_ratio=0.01,
-            use_weighted_std=False,
-        )
-        out_ewma = ewma.fit()[["sn","time","value","is_outlier"]].rename(
-            columns={"is_outlier":"is_outlier_ewma"}
-        )
-
-        # Join results
-        base = pdf[["sn","time","feature","value"]]
-        out = (
-            base.merge(out_kde, on=["sn","time","value"], how="left")
-                .merge(out_ewma, on=["sn","time","value"], how="left")
-        )
-
-        out[["is_outlier_kde","is_outlier_ewma"]] = (
-            out[["is_outlier_kde","is_outlier_ewma"]].fillna(False)
-        )
-
-        out = out[(out["is_outlier_kde"]) | (out["is_outlier_ewma"])]
-
-        return out[["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"]]
-
-    except Exception:
-        return pd.DataFrame(columns=["sn","time","feature","value","is_outlier_kde","is_outlier_ewma"])
+    def __init__(self,d,df_heartbeat): 
+        self.d = d
+        self.df_heartbeat = df_heartbeat
+
+        
+        self.df_price_cap = self.get_price_plan_df()
+        self.df_cust = self.get_customer_df()
+        self.df_throughput = self.get_throughput_df()
+        self.df_linkCapacity = self.get_linkCapacity_df()
+        self.df_ServiceTime = self.get_ServiceTime_df()
+        self.df_score = self.get_score_df()
+
+    def get_price_plan_df(self):
+        """
+        price_plan_data = [
+            ('67577', 50, 6), ('50011', 50, 6), ('38365', 50, 6), ('50010', 50, 6), ('75565', 50, 6), 
+            ('65655', 50, 6), ('67584', 50, 6), ('65656', 50, 6), ('67571', 100, 10), ('50128', 300, 20), 
+            ('50127', 300, 20), ('75561', 300, 20), ('67576', 300, 20), ('50130', 300, 20), ('50129', 300, 20), 
+            ('67567', 400, 20), ('50044', 400, 20), ('50116', 1500, 75), ('67568', 1500, 75), ('75560', 1500, 75)
+        ]
+        """
+        price_plan_data = [
+                            ('38365', 50, 6), ('39425', 1500, 75), ('39428', 1500, 75), ('46798', 10, 5), ('46799', 25, 5),
+                            ('48390', 10, 5), ('48423', 25, 5), ('48445', 50, 6), ('50010', 50, 6), ('50011', 50, 6),
+                            ('50044', 300, 20), ('50055', 300, 20), ('50116', 1500, 75), ('50117', 1500, 75), ('50127', 300, 20),
+                            ('50128', 300, 20), ('50129', 300, 20), ('50130', 300, 20), ('51219', 150, 10), ('53617', 300, 20),
+                            ('65655', 50, 6), ('65656', 50, 6), ('67567', 400, 20), ('67568', 1500, 75), ('67571', 100, 10),
+                            ('67576', 300, 20), ('67577', 50, 6), ('67584', 50, 6), ('75560', 1500, 75), ('75561', 300, 20),
+                            ('75565', 50, 6)
+                            ]
+
+        columns = ['PPLAN_CD', 'DL_CAP', 'UL_CAP']
+
+        df_price_cap = spark.createDataFrame(price_plan_data, columns)
+        return df_price_cap
+
+    def get_customer_df(self, date_val = None):
+        if date_val is None:
+            date_val =  datetime.strptime(self.d, '%Y-%m-%d')    
+
+        
+        df_mapping = spark.read.option("header","true").csv(hdfs_pa + "/sha_data/combinedsnmappingv2")\
+                    .select("mdn","sn","user_type").distinct()\
+                    .withColumnRenamed("mdn", "MDN_5G")
+ 
+        sn_counts_df = df_mapping.groupBy("MDN_5G")\
+                                .agg(F.countDistinct("sn").alias("unique_sn_count") )
+
+        df_with_counts = df_mapping.join(sn_counts_df, "MDN_5G")
+
+        df_mapping = df_with_counts.filter(
+                                            (F.col("unique_sn_count") == 1) | 
+                                            ((F.col("unique_sn_count") > 1) & (F.col("user_type").isNotNull()))
+                                        )\
+                                    .drop("unique_sn_count","user_type") # Drop the helper column at the end
+
+        for i in range(3):
+            loop_date_str = (date_val - timedelta(days=i)).strftime('%Y-%m-%d')
+            custline_path = hdfs_pa + "/user/kovvuve/EDW_SPARK/cust_line/"+ loop_date_str
+            
+            try:
+                df_cust = spark.read.option("recursiveFileLookup", "true").option("header", "true")\
+                                .csv(custline_path)\
+                                .withColumnRenamed("VZW_IMSI", "IMSI")\
+                                .withColumnRenamed("MTN", "MDN_5G")\
+                                .withColumn("IMEI", F.expr("substring(IMEI, 1, length(IMEI)-1)"))\
+                                .withColumn("CPE_MODEL_NAME", F.split(F.trim(F.col("DEVICE_PROD_NM")), " "))\
+                                .withColumn("CPE_MODEL_NAME", F.col("CPE_MODEL_NAME")[F.size("CPE_MODEL_NAME") - 1])\
+                                .select("IMSI", "MDN_5G", "PPLAN_CD", "PPLAN_DESC", "CPE_MODEL_NAME")\
+                                .dropDuplicates()\
+                                .join(df_mapping, "MDN_5G")
+                
+                return df_cust
+            
+            except Exception as e:
+                print(f"Error reading data for {loop_date_str}: {e}")
+        
+        return None
+
+    
+    def get_throughput_df(self, df_cust = None,df_price_cap = None):
+        if df_cust is None:
+            df_cust = self.df_cust
+        if df_price_cap is None:
+            df_price_cap = self.df_price_cap
+
+        ultra_schema = StructType([
+            StructField("IMSI", StringType(), True),
+            StructField("UE_OVERALL_DL_SPEED", DoubleType(), True)
+        ])
+
+        # Try to read the CSV and handle the case where it might not exist
+        try:
+            self.d = datetime.strptime(self.d, '%Y-%m-%d')
+            prev_dates = [(self.d - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(1, 4)]
+
+            # Read data from the previous 3 days
+            df_ultra = spark.read.option("header", "true") \
+                .csv([hdfs_pa + f"/fwa/npp_mdn_agg_insights_rtt/datadate={date}" for date in prev_dates]) \
+                .select("IMSI", 'UE_OVERALL_DL_SPEED') \
+                .filter(F.col("UE_OVERALL_DL_SPEED").isNotNull()) \
+                .filter(F.col("UE_OVERALL_DL_SPEED") != 0) \
+                .groupBy('IMSI') \
+                .agg(F.avg('UE_OVERALL_DL_SPEED').alias('UE_OVERALL_DL_SPEED'))
+            
+        except Exception as e:
+            email_sender.send(
+                    send_from="cellular_Score@verizon.com",
+                    subject=f"ultragauge missed at {self.d}",
+                    text=e
+                )
+            df_ultra = spark.createDataFrame([], ultra_schema)  # Create an empty DataFrame if not exists
+
+        # Continue with df_ultra as normal
+        df_ultrag_price_cap = df_cust.join(df_ultra, "IMSI", "left")\
+            .join(df_price_cap, "PPLAN_CD", "left")\
+            .withColumn(
+                "ULTRAGAUGE_DL_SCORE",
+                F.round(
+                    F.when((F.col("UE_OVERALL_DL_SPEED") / F.col("DL_CAP") * 2) > 1, 1)
+                    .otherwise(F.col("UE_OVERALL_DL_SPEED") / F.col("DL_CAP") * 2), 4)
+            )\
+            .withColumn(
+                "ULTRAGAUGE_DL_SCORE", col("ULTRAGAUGE_DL_SCORE")*100
+            )\
+
+        try:
+            speedtest_path = hdfs_pd + "/user/ZheS//5g_homeScore/speed_test/" + self.d
+            df_speedtest = spark.read.parquet(speedtest_path)\
+                                .filter(F.col("progress") == 100)\
+                                .filter(F.col("DOWNLOADRESULT").isNotNull())\
+                                .filter(F.col("DOWNLOADRESULT")!=0)\
+                                .filter(F.col("UPLOADRESULT").isNotNull())\
+                                .filter(F.col("UPLOADRESULT")!=0)\
+                                .select(F.col("mdn").alias("MDN_5G"),
+                                        F.round(F.col("downloadresult"), 0).alias("DOWNLOADRESULT"),
+                                        F.round(F.col("uploadresult"), 0).alias("UPLOADRESULT"),
+                                        F.round(F.col("latency"), 0).alias("LATENCY"),
+                                        )\
+                                .groupby("MDN_5G")\
+                                .agg( F.avg("DOWNLOADRESULT").alias("DOWNLOADRESULT"),
+                                        F.avg("UPLOADRESULT").alias("UPLOADRESULT"),
+                                )\
+                                .dropDuplicates()
+        except:
+
+            # Create an empty DataFrame with the same schema
+            empty_schema = StructType([
+                StructField("MDN_5G", StringType(), True),
+                StructField("DOWNLOADRESULT", DoubleType(), True),
+                StructField("UPLOADRESULT", DoubleType(), True)
+            ])
+            df_speedtest = spark.createDataFrame([], empty_schema)
+        
+        df_throughput = df_ultrag_price_cap.join(df_speedtest, "MDN_5G", "left")\
+                                .withColumn(
+                                    "Download_Score", 
+                                    F.round(
+                                            F.when((F.col("DOWNLOADRESULT") / F.col("DL_CAP")) > 1, 1)
+                                            .otherwise(F.col("DOWNLOADRESULT") / F.col("DL_CAP")), 
+                                            4) )\
+                                .withColumn(
+                                    "Upload_Score", 
+                                    F.round(F.when((F.col("UPLOADRESULT") / F.col("UL_CAP")) > 1, 1)
+                                     .otherwise(F.col("UPLOADRESULT") / F.col("UL_CAP")), 4) )\
+                                .withColumn(
+                                    "Download_Score", col("Download_Score")*100)\
+                                .withColumn(
+                                    "Upload_Score", col("Upload_Score")*100)
+        
+        return df_throughput
+
+    def get_linkCapacity_df(self, df_heartbeat = None, df_cust = None, df_price_cap = None):
+        if df_heartbeat is None:
+            df_heartbeat = self.df_heartbeat
+        if df_cust is None:
+            df_cust = self.df_cust
+        if df_price_cap is None:
+            df_price_cap = self.df_price_cap
+
+        df_heartbeat = df_heartbeat.join(df_cust, ["sn","IMSI"], "right")\
+                                    .join(df_price_cap, "PPLAN_CD", "right")\
+
+        df_with_bandwidths = df_heartbeat.withColumnRenamed("SNR", "_4gsnr").withColumnRenamed("5GSNR", "_5gsnr")\
+                                        .filter(
+                                                    (F.col("_4gsnr").between(-10, 40)) & (F.col("_4gsnr") != 0) |
+                                                    (F.col("_5gsnr").between(-10, 40)) & (F.col("_5gsnr") != 0)
+                                                )\
+                                        .withColumn(
+                                            "_lte_band",
+                                            (F.when(F.col("4GPccBand").cast("bigint") > 0, 20).otherwise(0) +
+                                            F.when(F.col("4GScc1Band").cast("bigint") > 0, 20).otherwise(0) +
+                                            F.when(F.col("4GScc2Band").cast("bigint") > 0, 20).otherwise(0) +
+                                            F.when(F.col("4GScc3Band").cast("bigint") > 0, 20).otherwise(0))
+                                        ).withColumn(
+                                            "_nwbandwidth",
+                                            (F.when((F.col("5GPccBand").cast("bigint") > 0) & (F.col("5GPccBand").cast("bigint") != 77), 20).otherwise(0) +
+                                            F.when((F.col("5GScc1Band").cast("bigint") > 0) & (F.col("5GScc1Band").cast("bigint") != 77), 20).otherwise(0))
+                                        ).withColumn(
+                                            "_cbandbandwidths",
+                                            F.when(
+                                                (F.col("5GPccBand").cast("bigint") == 77) & (F.col("5GScc1Band").cast("bigint") == 77), 160
+                                            ).when(
+                                                (F.col("5GPccBand").cast("bigint") == 77) & (F.col("5GEARFCN_DL").between(646667, 653329)), 100
+                                            ).when(
+                                                (F.col("5GPccBand").cast("bigint") == 77) & (~F.col("5GEARFCN_DL").between(646667, 653329)), 60
+                                            ).when(
+                                                (F.col("5GPccBand").cast("bigint") != 77) & (F.col("5GScc1Band").cast("bigint") == 77), 80
+                                            ).otherwise(0)
+                                        )
+
+        df_linkCapacity = df_with_bandwidths.filter(
+                                        ( F.col("_lte_band") + F.col("_nwbandwidth") + F.col("_cbandbandwidths")) > 0
+                                        )\
+                                        .withColumn(
+                                            "lte_capacity",
+                                            F.round(
+                                                F.when(
+                                                    F.col("_4gsnr") == 0, 0
+                                                ).otherwise(
+                                                    F.col("_lte_band") * F.least(F.lit(1), (F.col("_4gsnr") + 11) / 41.0)
+                                                ), 2
+                                            )
+                                        ).withColumn(
+                                            "nw_capacity",
+                                            F.round(
+                                                F.when(
+                                                    F.col("_5gsnr") == 0, 0
+                                                ).otherwise(
+                                                    F.col("_nwbandwidth") * F.least(F.lit(1), (F.col("_5gsnr") + 11) / 41.0)
+                                                ), 2
+                                            )
+                                        ).withColumn(
+                                            "c_band_capacity",
+                                            F.round(
+                                                F.when(
+                                                    F.col("_5gsnr") == 0, 0
+                                                ).otherwise(
+                                                    F.col("_cbandbandwidths") * 0.8 * F.least(F.lit(1), (F.col("_5gsnr") + 10) / 41.0)
+                                                ), 2
+                                            )
+                                        )\
+                                        .withColumn(
+                                                "Rate_Plan_Adjustment", 
+                                                F.least(F.col("DL_CAP") / 150, F.lit(1.0))
+                                            )\
+                                        .withColumn(
+                                            "_capacity", 
+                                            F.round(
+                                                100*((F.col("lte_capacity") + F.col("nw_capacity") + F.col("c_band_capacity")) /  (218*col("Rate_Plan_Adjustment") ) ),
+                                                2)
+                                            )\
+                                        .withColumn(
+                                            "_capacity", 
+                                            F.round(
+                                                        F.when((F.col("_capacity")) > 100, 100)
+                                                        .otherwise(F.col("_capacity")), 
+                                                    4) )\
+                                        .groupby("sn", "MDN_5G")\
+                                        .agg( 
+                                            F.round(F.avg("lte_capacity"),2).alias("lte_capacity"), 
+                                            F.round(F.avg("nw_capacity"),2).alias("nw_capacity"), 
+                                            F.round(F.avg("c_band_capacity"),2).alias("c_band_capacity"), 
+                                            F.round(F.avg("Rate_Plan_Adjustment"),2).alias("Rate_Plan_Adjustment"), 
+                                            F.round(F.avg("_capacity"),2).alias("capacity_score") 
+                                            )\
+                                        .withColumn( "capacity_score_category", 
+                                                    when(col("capacity_score").isNull(), None)
+                                                    .when(col("capacity_score") >= 80, "Excellent")
+                                                    .when(col("capacity_score") >= 50, "Good")
+                                                    .when(col("capacity_score") >= 30, "Fair")
+                                                    .otherwise("Poor") )
+
+
+        return df_linkCapacity
+
+    def get_ServiceTime_df(self, df_heartbeat = None):
+
+        if df_heartbeat is None:
+            df_heartbeat = self.df_heartbeat
+        
+        window_spec = Window.partitionBy("sn").orderBy("ServiceUptime") 
+
+        df_heartbeat = df_heartbeat.filter( (col("ServiceDowntime")!="184467440737095")&
+                                                (col("ServiceUptime")!="184467440737095")
+                                                )\
+                                    .withColumn("ServiceDowntime_change", 
+                                            when(col("ServiceDowntime") != F.lag("ServiceDowntime").over(window_spec), 1).otherwise(0))\
+                                    .withColumn("_ServiceUptime_change", 
+                                            when(col("ServiceUptime") == F.lag("ServiceUptime").over(window_spec), 1).otherwise(0))\
+                                    .withColumn("ServiceUptime_change", 
+                                            when(col("ServiceUptime") != F.lag("ServiceUptime").over(window_spec), 1).otherwise(0))
+                                            
+        for feature in count_features: 
+            # It is tricky of whether | filter( col(feature)!=0 ) |
+            df_heartbeat = df_heartbeat\
+                                    .withColumn("prev_"+feature, F.lag(feature).over(window_spec))\
+                                    .withColumn("pre<cur", 
+                                                F.when(F.col("prev_"+feature) <= F.col(feature) , 1).otherwise(0))\
+                                    .withColumn("increment_" + feature, 
+                                                F.when((F.col("pre<cur") == 1) & (F.col("prev_" + feature).isNotNull()), 
+                                                    F.col(feature) - F.col("prev_" + feature)) 
+                                                .otherwise(F.coalesce(F.col(feature), F.lit(0) )))
+
+
+        sum_columns = [F.sum("increment_" + feature).alias("sum_" + feature) for feature in count_features] 
+        df_count = df_heartbeat.groupby("sn")\
+                                .agg( 
+                                    *sum_columns,
+                                    sum("ServiceDowntime_change").alias("ServiceDowntime_sum"),
+                                    sum("ServiceDowntime_change").alias("_ServiceUptime_sum"),
+                                    sum("ServiceUptime_change").alias("ServiceUptime_sum"),
+                                    )\
+                                .withColumn("ServicetimePercentage", 100*col("_ServiceUptime_sum")/(col("_ServiceUptime_sum")+col("ServiceUptime_sum") ) )\
+                                .withColumn( "assumed_downtime", F.col("sum_RRCConnectFailureCount") * 1 + F.col("sum_LTERACHFailureCount") * 0.01 + F.col("_ServiceUptime_sum")*300 )\
+                                .withColumn(
+                                    "not_available_percentage",
+                                    (F.col("assumed_downtime") / ( 24*60*60 )) * 100
+                                )\
+                                .withColumn( "availability_score",
+                                            F.when(
+                                                (100 - 20 * F.col("not_available_percentage") ) < 0, 
+                                                0 
+                                            ).otherwise(
+                                                F.round(100 - 20 * F.col("not_available_percentage") , 2) 
+                                            )
+                                        )\
+                                .withColumn( "availability_score_category", 
+                                                when(col("availability_score").isNull(), None)
+                                                .when(col("availability_score") == 100, "Excellent")
+                                                .when(col("availability_score") >= 99.77, "Good")
+                                                .when(col("availability_score") >= 97.22, "Fair")
+                                                .otherwise("Poor") )
+
+
+        return df_count
+    
+    def get_score_df(self, df_throughput = None, df_linkCapacity = None, df_ServiceTime = None):
+        if df_throughput is None:
+            df_throughput = self.df_throughput
+        if df_linkCapacity is None:
+            df_linkCapacity = self.df_linkCapacity
+        if df_ServiceTime is None:
+            df_ServiceTime = self.df_ServiceTime
+
+        df_join = df_throughput.join(df_linkCapacity, ["sn","MDN_5G"], "full" )\
+                                .join(df_ServiceTime, "sn" ,"full" )
+
+        throughput_score_weights = {
+                                    "ultragauge_dl_score": 28,
+                                    "download_score": 4,
+                                    "upload_score": 1,
+                                }
+        throughput_score_calculator = ScoreCalculator(throughput_score_weights)
+        throughput_score_udf = udf(throughput_score_calculator.calculate_score, FloatType())
+
+        from pyspark.sql.functions import sum, lag, col
+        df_score = df_join.withColumn(
+                                        "throughput_score",
+                                        F.round(
+                                            throughput_score_udf(*[col(column) for column in throughput_score_weights.keys()]), 
+                                            2
+                                        )
+                                    )\
+                            .withColumn(
+                                        "throughput_score_category",
+                                        when(col("throughput_score").isNull(), None)  # Set NULL if throughput_score is NULL
+                                        .when(col("throughput_score") >= 80, "Excellent")
+                                        .when(col("throughput_score") >= 60, "Good")
+                                        .when(col("throughput_score") >= 30, "Fair")
+                                        .otherwise("Poor")
+                                    )
+
+
+        categorical_columns = [
+                                    "throughput_score_category", "capacity_score_category", "availability_score_category",]
+
+        for col_name in categorical_columns:
+            df_score = convert_to_numeric(df_score, col_name) #"{col_name}_numeric"
+
+
+        score_weights = {
+                            "availability_score_category_numeric": 5,
+                            "capacity_score_category_numeric": 2,
+                            "throughput_score_category_numeric": 1,
+                        }
+        score_calculator = ScoreCalculator(score_weights)
+        score_udf = udf(score_calculator.calculate_score, FloatType())
+
+        df_score = df_score.withColumn(
+                                        "score",
+                                        F.round(
+                                            score_udf(*[col(column) for column in score_weights.keys()]), 
+                                            2
+                                        )
+                                    )
+        
+        df_score = convert_to_categorical(df_score, "score")
+
+        return df_score
+
 
 if __name__ == "__main__":
-    # Spark
-    spark = (
-        SparkSession.builder
-        .appName('kdeDetectionPipeline_zhe')
-        .config("spark.sql.adapative.enabled", "true")
-        .config("spark.sql.shuffle.partitions", 1200)\
-        .getOrCreate()
-    )
-    spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")    
+    email_sender = MailSender()
+    desired_partition_number = 2000
+    spark = SparkSession.builder\
+            .appName('cpe_Score_ZheS')\
+            .config("spark.sql.adapative.enabled","true")\
+            .config("spark.sql.shuffle.partitions", desired_partition_number)\
+            .config("spark.ui.port","24041")\
+            .enableHiveSupport().getOrCreate()
 
-    file_path = hdfs_namenode + base_dir + (date.today() - timedelta(days=2)).strftime('%Y-%m-%d')
-    model_name = "ASK-NCM1100"
+    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    hdfs_pa =  'hdfs://njbbepapa1.nss.vzwnet.com:9000'
+    #date_str = (date.today() - timedelta(1) ).strftime("%Y-%m-%d")
+    #ins = CellularScore(d = date_str)
 
-    now = datetime.now()
-    #now = datetime(2025, 8, 28, 10, 30, 0) # Year, Month, Day, Hour, Minute, Second
 
-    file_paths = []
 
-    for i in range(200):
-        current_hour_dt = now - timedelta(hours=i)
+    backfill_range = 1
+    parser = argparse.ArgumentParser(description="Inputs") 
+    parser.add_argument("--date", default=(date.today() - timedelta(1) ).strftime("%Y-%m-%d")) 
+    args_date = parser.parse_args().date
+    date_list = [( datetime.strptime( args_date, "%Y-%m-%d" )  - timedelta(days=i)).date() for i in range(backfill_range)][::-1]
+
+    hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+    def process_cpe_data(date_list, email_sender):
+        for date_val in date_list:
+            date_str = date_val.strftime('%Y-%m-%d')
+            file_path = f"{hdfs_pd}/user/ZheS/cpe_Score/all_score/{date_str}"
+
+            try:
+
+
+                owl_base_path = hdfs_pa + "/sha_data/OWLHistory/"
+                owl_path = f"{owl_base_path}date={date_str.replace('-', '')}/"
+                df_owl = spark.read.parquet(owl_path)\
+                            .filter(col("Owl_Data_fwa_cpe_data").isNotNull())\
+                            .withColumn("fwa_cpe_data", from_json(col("Owl_Data_fwa_cpe_data"), schema))\
+                            .select("rowkey", "ts", "Tplg_Data_model_name", "fwa_cpe_data.*")\
+                            .withColumn("SNR", col("SNR").cast("double"))\
+                            .dropDuplicates()\
+                            .withColumn("sn", F.regexp_extract(F.col("rowkey"), r'-(\w+)_', 1))\
+                            .withColumn('time', F.from_unixtime(col('ts') / 1000.0).cast('timestamp'))
         
-        date_str = current_hour_dt.strftime("%Y-%m-%d")
-        hour_str = current_hour_dt.strftime("hr=%H")
-        
-        path = f"{hdfs_namenode}/{base_dir}{date_str}/{hour_str}"
-        file_paths.append(path)
-
-    sn_list = ['ACR50220495', 'ACR50219952', 'ACR45123236', 'ACR50709744', 'ACR45127066', 'ACR50407638', 'ACR51109908', 'ACR52417251', 'ACR51317239', 'ACR44810858', 'ACR43301951', 'ACR43103903', 'ACR43105974', 'ACR44214489', 'ACR52212239', 'ACR44717227', 'ACR50111657', 'ACR51112474', 'ACR44000230', 'ACR52505377', 'ACR45011967', 'ACR50210814', 'ACR43712925', 'ACR44700139', 'ACR50401575', 'ACR51312404', 'ACR52605358', 'ACR50204281', 'ACR44713139', 'ACR52304552', 'ACR50705978', 'ACR44510528', 'ACR43714196', 'ACR44909542', 'ACR52301175', 'ACR44406975', 'ACR44518289', 'ACR43403518', 'ACR44902646', 'ACR44003303', 'ACR51110264', 'ACR45105556', 'ACR42006080', 'ACR52601816', 'ACR44700010', 'ACR51519291', 'ACR51701149', 'ACR43513827', 'ACR50204843', 'ACR42812887', 'ACR44700266', 'ACR50719917', 'ACR43100493', 'ACR51106604', 'ACR43310012', 'ACR51505149', 'ACR50423435', 'ACR50906565', 'ACR43109313', 'ACR44723610', 'ACR51717554', 'ACR43308279', 'ACR44715171', 'ACR45004304', 'ACR44522300', 'ACR45125537', 'ACR51314147', 'ACR44902044', 'ACR50419211', 'ACR43400537', 'ACR51508875', 'ACR50907524', 'ACR42802896', 'ACR43103268', 'ACR44516105', 'ACR44801791', 'ACR50211956', 'ACR42807055', 'ACR45122687', 'ACR51304508', 'ACR44810561', 'ACR44007959', 'ACR43511767', 'ACR45100534', 'ACR45120057', 'ACR44902278', 'ACR51315781', 'ACR42407111', 'ACR50709571', 'ACR50205333', 'ACR44810509', 'ACR50115055', 'ACR50706528', 'ACR44005591', 'ACR44701895', 'ACR50208010', 'ACR42201924', 'ACR44010952', 'ACR51506275', 'ACR44900466']
-    #sn_list = sn_list[:40]
-
-    df = spark.read.option("header","true").csv(file_paths)
-
-    df = (
-        df
-        .withColumnRenamed("mdn", "MDN")
-        .withColumn("MDN", F.regexp_replace(F.col("MDN"), '"', ''))
-        .withColumn(TIME_COL, F.from_unixtime(F.col("ts") / 1000.0).cast("timestamp"))
-        .select(["sn", "MDN", TIME_COL] + ALL_FEATURES)
-        .dropDuplicates()
-        .filter( col("sn").isin(sn_list) )
-        .filter(col("ModelName") == model_name)  # Include ModelName in select() above if you enable this
-    )
-
-# 2.Preprocess
-    df = convert_string_numerical(df, ALL_FEATURES)
-
-    
-    df = forward_fill(df, ZERO_LIST, "sn", "time")
-    df = df.orderBy("sn", "time")
-
-    # Throughput features → hourly increments pipeline
-    proc = (
-        HourlyIncrementProcessor(df, feature_groups["throughput_data"], partition_col=["sn"])
-        .run(steps=('incr', 'log', 'fill'))
-    )
-    df = proc.df_hourly
+                ins = CellularScore(d = date_str, df_heartbeat = df_owl)
+                ins.df_score.write.mode("overwrite").parquet(f"/user/ZheS/cpe_Score/all_score/{date_str}")
+                ins.df_cust.write.mode("overwrite").parquet(f"/user/ZheS/cpe_Score/df_cust/{date_str}")
+                ins.df_linkCapacity.write.mode("overwrite").parquet(f"/user/ZheS/cpe_Score/df_linkCapacity/{date_str}")
+                ins.df_ServiceTime.write.mode("overwrite").parquet(f"/user/ZheS/cpe_Score/df_ServiceTime/{date_str}")
+                ins.df_throughput.write.mode("overwrite").parquet(f"/user/ZheS/cpe_Score/df_throughput/{date_str}")
+                
+                
 
 
-    df_slice = split_into_subseries(df, length=200, shift=1, sn_col="sn", time_col="time")
-    df_slice = df_slice.drop("sn")\
-                        .withColumnRenamed("series_id", "sn")
-    df_slice.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
-    """    """
-    df_slice=spark.read.parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/data")
+            except Exception as e:
+                error_message = ( f"cpe_Score failed at {date_str}\n\n{traceback.format_exc()}" )
+                print(error_message)
+                email_sender.send(
+                                    send_from=f"cpe_Score@verizon.com",
+                                    subject=f"cpe_Score failed !!! at {date_str}",
+                                    text=error_message
+                                )
+    import time
+    start_time = time.perf_counter()
 
-    #df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=ZERO_LIST)
-    df_long = unpivot_wide_to_long(df_slice, time_col=TIME_COL, feature_cols=ALL_FEATURES)
+    process_cpe_data(date_list, email_sender)
 
+    end_time = time.perf_counter()
 
-#3. Distributed Modeling
-    df_result = df_long.groupBy("sn","feature")\
-                        .applyInPandas(groupwise_novelty_both, schema=anomaly_schema_wide)
-
-    df_result.write.mode("overwrite").parquet("/user/ZheS/owl_anomaly/processed_ask-ncm1100_hourly_features/results")
-
-#sn_list = ['ACR50220495', 'ACR50219952', 'ACR45123236', 'ACR50709744', 'ACR45127066', 'ACR50407638', 'ACR51109908', 'ACR52417251', 'ACR51317239', 'ACR44810858', 'ACR43301951', 'ACR43103903', 'ACR43105974', 'ACR44214489', 'ACR52212239', 'ACR44717227', 'ACR50111657', 'ACR51112474', 'ACR44000230', 'ACR52505377', 'ACR45011967', 'ACR50210814', 'ACR43712925', 'ACR44700139', 'ACR50401575', 'ACR51312404', 'ACR52605358', 'ACR50204281', 'ACR44713139', 'ACR52304552', 'ACR50705978', 'ACR44510528', 'ACR43714196', 'ACR44909542', 'ACR52301175', 'ACR44406975', 'ACR44518289', 'ACR43403518', 'ACR44902646', 'ACR44003303', 'ACR51110264', 'ACR45105556', 'ACR42006080', 'ACR52601816', 'ACR44700010', 'ACR51519291', 'ACR51701149', 'ACR43513827', 'ACR50204843', 'ACR42812887', 'ACR44700266', 'ACR50719917', 'ACR43100493', 'ACR51106604', 'ACR43310012', 'ACR51505149', 'ACR50423435', 'ACR50906565', 'ACR43109313', 'ACR44723610', 'ACR51717554', 'ACR43308279', 'ACR44715171', 'ACR45004304', 'ACR44522300', 'ACR45125537', 'ACR51314147', 'ACR44902044', 'ACR50419211', 'ACR43400537', 'ACR51508875', 'ACR50907524', 'ACR42802896', 'ACR43103268', 'ACR44516105', 'ACR44801791', 'ACR50211956', 'ACR42807055', 'ACR45122687', 'ACR51304508', 'ACR44810561', 'ACR44007959', 'ACR43511767', 'ACR45100534', 'ACR45120057', 'ACR44902278', 'ACR51315781', 'ACR42407111', 'ACR50709571', 'ACR50205333', 'ACR44810509', 'ACR50115055', 'ACR50706528', 'ACR44005591', 'ACR44701895', 'ACR50208010', 'ACR42201924', 'ACR44010952', 'ACR51506275', 'ACR44900466']
-    
+    elapsed_time = end_time - start_time
+    print(f"Function ran in {elapsed_time:.4f} seconds")
