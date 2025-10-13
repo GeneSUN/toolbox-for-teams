@@ -1,853 +1,855 @@
 from datetime import datetime, timedelta, date
-from pyspark.sql.window import Window
-from pyspark.sql.functions import sum, lag, col, split, concat_ws, lit ,udf,count, max,lit,avg, when,concat_ws,to_date,explode
-from pyspark.sql.types import *
-from pyspark.sql.types import FloatType
+from functools import reduce
+
 from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
 from pyspark.sql import functions as F
-import numpy as np
-import sys 
-import traceback
-from pyspark.sql.functions import from_unixtime 
-import argparse 
-import pandas as pd
-from functools import reduce
 from pyspark.sql import DataFrame
+from pyspark.sql.types import (
+    FloatType,
+    IntegerType,
+    StringType,
+    StructType,
+    Row,
+)
+from pyspark.sql.functions import (
+    sum,
+    lag,
+    col,
+    split,
+    concat_ws,
+    lit,
+    udf,
+    count,
+    max,
+    avg,
+    when,
+    to_date,
+    explode,
+    from_unixtime,
+    to_timestamp
+)
 
-from pyspark.sql import SparkSession, DataFrame, functions as F
-from pyspark.sql.types import *
-from pyspark.sql import Row
-from functools import reduce
-from datetime import datetime, timedelta
+# Optional but common imports you had:
+import numpy as np
+import pandas as pd
+import sys 
+import time
 
-from pyspark.sql import SparkSession, functions as F, Window
-from datetime import timedelta
+class LogTime:
+    def __init__(self, verbose=True, minimum_unit="microseconds") -> None:
+        self.minimum_unit = minimum_unit
+        self.elapsed = None
+        self.verbose = verbose
 
-sys.path.append('/usr/apps/vmas/scripts/ZS') 
-from MailSender import MailSender
-def flatten_df_v2(nested_df):
-    # flat the nested columns and return as a new column
-    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
-    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
-    array_cols = [c[0] for c in nested_df.dtypes if c[1][:5] == "array"]
-    #print(len(nested_cols))
-    if len(nested_cols)==0 and len(array_cols)==0 :
-        #print(" dataframe flattening complete !!")
-        return nested_df
-    elif len(nested_cols)!=0:
-        flat_df = nested_df.select(flat_cols +
-                                   [F.col(nc+'.'+c).alias(nc+'_b_'+c)
-                                    for nc in nested_cols
-                                    for c in nested_df.select(nc+'.*').columns])
-        return flatten_df_v2(flat_df)
-    elif len(array_cols)!=0:
-        for array_col in array_cols:
-            flat_df = nested_df.withColumn(array_col, F.explode(F.col(array_col)))
-        return flatten_df_v2(flat_df) 
-def read_file_by_date(date, file_path_pattern): 
-    try:
-        file_path = file_path_pattern.format(date) 
-        df = spark.read.parquet(file_path) 
-        return df 
-    except:
-        return None
-    
-class ScoreCalculator: 
-    def __init__(self, weights): 
-        self.weights = weights 
- 
-    def calculate_score(self, *args): 
-        total_weight = 0 
-        score = 0 
+    def __enter__(self):
+        self.start = time.time()
+        return self
 
-        for weight, value in zip(self.weights.values(), args): 
-            if value is not None: 
-                score += weight * float(value) 
-                total_weight += weight 
+    def __exit__(self, *args):
+        self.elapsed = time.time() - self.start
+        self.elapsed_str = self._format_time(self.elapsed)
+        if self.verbose:
+            print(f"Time Elapsed: {self.elapsed_str}")
 
-        return score / total_weight if total_weight != 0 else None 
-    
-def process_parquet_files_for_date_range(date_range, file_path_pattern): 
+    def _format_time(self, seconds: float) -> str:
+        """
+        Convert seconds into a human-readable string.
+        """
+        if seconds < 1e-3:  # less than 1 ms
+            return f"{seconds*1e6:.2f} µs"
+        elif seconds < 1:   # less than 1 second
+            return f"{seconds*1e3:.2f} ms"
+        elif seconds < 60:  # less than 1 minute
+            return f"{seconds:.2f} s"
+        elif seconds < 3600:  # less than 1 hour
+            m, s = divmod(seconds, 60)
+            return f"{int(m)}m {s:.2f}s"
+        else:
+            h, r = divmod(seconds, 3600)
+            m, s = divmod(r, 60)
+            return f"{int(h)}h {int(m)}m {s:.2f}s"
 
-    df_list = list(map(lambda date: read_file_by_date(date, file_path_pattern), date_range)) 
-    df_list = list(filter(None, df_list)) 
-    result_df = reduce(lambda df1, df2: df1.union(df2), df_list) 
 
-    return result_df 
+class StationConnectionProcessor:
+    # fixed constant
+    PERCENTILES = [0.03, 0.1, 0.5, 0.9]
 
-def replace_rows(base_df: DataFrame, update_df: DataFrame, key_col: str = "sn") -> DataFrame:
-    """
-    Replace rows in base_df with rows from update_df when key_col matches.
+    def __init__(self, spark, input_path, output_path, date_str, hour_str):
+        """
+        :param spark: active SparkSession
+        :param input_path: str, base HDFS path
+        :param output_path: str, output HDFS path
+        :param date_str: str, e.g. "20250901"
+        :param hour_str: str, e.g. "13"
+        """
+        self.spark = spark
+        self.input_path = input_path.rstrip("/")
+        self.output_path = output_path.rstrip("/")
+        self.date_str = date_str
+        self.hour_str = hour_str
 
-    Args:
-        base_df (DataFrame): Original dataframe (full but possibly outdated).
-        update_df (DataFrame): Dataframe containing newer rows (partial).
-        key_col (str): Column name to use as the unique identifier.
+    def compute_stationarity(self):
+        """Step 1: Compute stationarity (daily level)."""
+        df_sh = self.spark.read.parquet(f"{self.input_path}/date={(datetime.strptime(self.date_str, '%Y%m%d') - timedelta(days=1)).strftime('%Y%m%d')}")
 
-    Returns:
-        DataFrame: Combined dataframe with rows from update_df replacing base_df.
-    """
-    # customers to update
-    update_keys = update_df.select(key_col).distinct()
+        df = (
+            df_sh.withColumn("signal_strength", F.col("Station_Data_connect_data.signal_strength"))
+            .filter(F.col("signal_strength").isNotNull())
+            .select("Tplg_Data_model_name", "rowkey", "station_data_connect_data.*")
+            .withColumn("sn", F.regexp_extract("rowkey", r"-([A-Z0-9]+)_", 1))
+        )
 
-    # keep only rows in base_df that are not in update_df
-    base_remaining = base_df.join(update_keys, on=key_col, how="left_anti")
+        # Window per (sn, station_mac)
+        window_spec = Window().partitionBy("sn", "station_mac")
 
-    # union the updated rows
-    final_df = base_remaining.unionByName(update_df)
+        # Percentiles
+        p3 = F.expr(f'percentile_approx(signal_strength, {self.PERCENTILES[0]})').over(window_spec)
+        p10 = F.expr(f'percentile_approx(signal_strength, {self.PERCENTILES[1]})').over(window_spec)
+        p50 = F.expr(f'percentile_approx(signal_strength, {self.PERCENTILES[2]})').over(window_spec)
+        p90 = F.expr(f'percentile_approx(signal_strength, {self.PERCENTILES[3]})').over(window_spec)
 
-    return final_df
+        df_outlier = (
+            df.withColumn('3%_val', p3)
+              .withColumn('10%_val', p10)
+              .withColumn('50%_val', p50)
+              .withColumn('90%_val', p90)
+              .withColumn("lower_bound", F.col('10%_val') - 2 * (F.col('90%_val') - F.col('10%_val')))
+              .withColumn("outlier", F.when(F.col("lower_bound") < F.col("3%_val"), F.col("lower_bound")).otherwise(F.col("3%_val")))
+              .filter(F.col("signal_strength") > F.col("outlier"))
+        )
 
-class wifiKPIAnalysis:
+        stationary_daily_df = (
+            df_outlier.withColumn("diff", F.col('90%_val') - F.col('50%_val'))
+            .withColumn("stationarity", F.when(F.col("diff") <= 5, F.lit("1")).otherwise(F.lit("0")))
+            .groupby("sn", "station_mac").agg(F.max("stationarity").alias("mobility_status"))
+            .withColumn(
+                "mobility_status",
+                F.when(F.col("mobility_status") == 1, F.lit("Stationary")).otherwise(F.lit("Non-stationary"))
+            )
+        )
+        return stationary_daily_df
+
+    def process_hourly(self, stationary_daily_df):
+        """Step 2: Process hourly data and join with stationarity."""
+        w = Window.partitionBy("station_mac").rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+
+        exploded_df = (
+            self.spark.read.parquet(f"{self.input_path}/date={self.date_str}/hour={self.hour_str}")
+            .select("Tplg_Data_model_name", "rowkey", "station_data_connect_data.*")
+            .withColumn("sn", F.regexp_extract("rowkey", r"-([A-Z0-9]+)_", 1))
+            .withColumn("phy_rate", F.regexp_replace("link_rate", "Mbps", "").cast(IntegerType()))
+            .withColumn("tx_phy_rate", F.regexp_replace("tx_link_rate", "Mbps", "").cast(IntegerType()))
+            .withColumn("hour", F.date_format(F.from_unixtime(F.col("ts") / 1000), "HH"))
+            .withColumn("date", F.date_format(F.from_unixtime(F.col("ts") / 1000), "yyyyMMdd"))
+            .select(
+                "sn",
+                "station_mac",
+                "station_name",
+                F.col("connect_type").alias("band"),
+                F.col("signal_strength").alias("rssi"),
+                "snr",
+                "phy_rate",
+                "tx_phy_rate",
+                F.col("Tplg_Data_model_name").alias("model"),
+                "hour",
+                "date"
+            )
+            .withColumn("son", F.lit(0))
+            .withColumn("p50_rssi", F.percentile_approx("rssi", 0.5).over(w).cast("int"))
+            .withColumn("p90_rssi", F.percentile_approx("rssi", 0.9).over(w).cast("int"))
+            .join(stationary_daily_df, on=["sn", "station_mac"], how="left")
+        )
+
+        exploded_df.write.mode("overwrite").parquet(self.output_path)
+        return exploded_df
+
+    def run(self):
+        """Wrapper: run both steps end-to-end."""
+        stationary_daily_df = self.compute_stationarity()
+        final_df = self.process_hourly(stationary_daily_df)
+        return final_df
+
+
+
+class station_score_hourly:
     global hdfs_pd, hdfs_pa
     hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
     hdfs_pa =  'hdfs://njbbepapa1.nss.vzwnet.com:9000'
-
     def __init__(self,
-                 date_val,
-                 owl_path,
-                 station_history_path,
-                 deviceGroup_path,
-                 df_rssi_path,
-                 df_phyrate_path,
-                 wifiscore_path,
+                 spark,
+                 date_str,
+                 hour_str,
+                 source_df,
+                 output_path = hdfs_pa + f"/sha_data//vz-bhr-athena/reports/bhr_station_score_hourly_report_temp/"
                  ):
-        self.date_val = date_val
-        self.owl_path = owl_path
+        self.spark = spark
+        self.date_str = date_str
+        self.hour_str = hour_str
+        self.source_df = source_df
+
+        self.output_path = output_path
+
+    def run(self, source_df = None):
+        if source_df is not None:
+            self.source_df = source_df
+
+        self.source_df.createOrReplaceTempView('station_hourly_data')
+        station_hourly_data_with_count = self.spark.sql('''
+            SELECT
+                *,
+                COUNT(*) OVER (PARTITION BY sn, station_mac, date, hour) as record_count
+            FROM station_hourly_data
+        ''')
+        station_hourly_data_with_count.createOrReplaceTempView('station_hourly_data_cached')
+
+        combined_base_score = self.spark.sql('''
+            WITH
+            pivoted_data AS (
+                SELECT
+                sn, station_mac, date, hour,
+                MAX(model) as model,
+                MAX(mobility_status) as mobility_status,
+                MAX(station_name) as station_name,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.90) AS p90_rssi_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.90) AS p90_rssi_5g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.50) AS p50_rssi_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.50) AS p50_rssi_5g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.95) AS p95_rssi_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(p90_rssi AS DOUBLE) END, 0.95) AS p95_rssi_5g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(phy_rate AS DOUBLE) END, 0.9) AS p90_phy_rate_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(phy_rate AS DOUBLE) END, 0.9) AS p90_phy_rate_5g
+                FROM station_hourly_data_cached
+                WHERE record_count >= 9
+                GROUP BY sn, station_mac, date, hour
+            ),
+            base_scores AS (
+                SELECT
+                *,
+                CASE WHEN p90_rssi_2_4g >= -65 THEN 4 WHEN p90_rssi_2_4g BETWEEN -75 AND -66 THEN 3 WHEN p90_rssi_2_4g BETWEEN -85 AND -76 THEN 2 WHEN p90_rssi_2_4g < -85 THEN 1 END AS rssi_score_2_4g,
+                CASE WHEN p90_rssi_5g >= -68 THEN 4 WHEN p90_rssi_5g BETWEEN -78 AND -69 THEN 3 WHEN p90_rssi_5g BETWEEN -88 AND -79 THEN 2 WHEN p90_rssi_5g < -88 THEN 1 END AS rssi_score_5g,
+                CASE WHEN p90_phy_rate_2_4g >= 50 THEN 4 WHEN p90_phy_rate_2_4g BETWEEN 20 AND 49 THEN 3 WHEN p90_phy_rate_2_4g BETWEEN 10 AND 19 THEN 2 WHEN p90_phy_rate_2_4g < 10 THEN 1 END AS phy_rate_score_2_4g,
+                CASE WHEN p90_phy_rate_5g >= 200 THEN 4 WHEN p90_phy_rate_5g BETWEEN 100 AND 199 THEN 3 WHEN p90_phy_rate_5g BETWEEN 50 AND 99 THEN 2 WHEN p90_phy_rate_5g < 50 THEN 1 END AS phy_rate_score_5g
+                FROM pivoted_data
+            )
+            SELECT
+            *,
+            CASE WHEN rssi_score_2_4g IS NOT NULL AND rssi_score_5g IS NOT NULL THEN LEAST(rssi_score_2_4g, rssi_score_5g) WHEN rssi_score_2_4g IS NOT NULL THEN rssi_score_2_4g ELSE rssi_score_5g END AS final_rssi_score,
+            CASE WHEN phy_rate_score_2_4g IS NOT NULL AND phy_rate_score_5g IS NOT NULL THEN LEAST(phy_rate_score_2_4g, phy_rate_score_5g) WHEN phy_rate_score_2_4g IS NOT NULL THEN phy_rate_score_2_4g ELSE phy_rate_score_5g END AS final_phy_rate_score
+            FROM base_scores
+        ''')
+
+        variation_cal = self.spark.sql('''
+            WITH
+            variation_components AS (
+                SELECT
+                sn, station_mac, date, hour,
+                MAX(CAST(snr AS DOUBLE)) - MIN(CAST(snr AS DOUBLE)) as snr_range,
+                SUM(CASE WHEN son >= 1 THEN 1 ELSE 0 END) as son_count,
+                MAX(CASE WHEN band LIKE '2.4G%' THEN CAST(phy_rate AS DOUBLE) END) - MIN(CASE WHEN band LIKE '2.4G%' THEN CAST(phy_rate AS DOUBLE) END) as phy_rate_range_2_4g,
+                MAX(CASE WHEN band LIKE '5G%' THEN CAST(phy_rate AS DOUBLE) END) - MIN(CASE WHEN band LIKE '5G%' THEN CAST(phy_rate AS DOUBLE) END) as phy_rate_range_5g
+                FROM station_hourly_data_cached
+                WHERE record_count >= 9
+                GROUP BY sn, station_mac, date, hour
+            )
+            SELECT
+            sn, station_mac, date, hour,
+            snr_range,
+            son_count,
+            phy_rate_range_2_4g,
+            phy_rate_range_5g,
+            CASE
+                WHEN snr_range > 13
+                OR son_count > 6
+                OR phy_rate_range_2_4g > 30
+                OR phy_rate_range_5g > 300
+                THEN 1
+                ELSE 0
+            END AS variation_score
+            FROM variation_components
+        ''')
+
+
+        output_df = combined_base_score.alias("b").join(
+            variation_cal.alias("v"),
+            on=['sn', 'station_mac', 'date', 'hour'],
+            how='inner'
+        ).selectExpr(
+            "b.sn",
+            "b.station_mac",
+            "b.station_name",
+            "b.model",
+            "b.mobility_status",
+            "b.date",
+            "b.hour",
+            "b.p90_rssi_2_4g AS p90_rssi_2_4g_base",
+            "b.p90_rssi_5g AS p90_rssi_5g_base",
+            "b.p50_rssi_2_4g AS p50_rssi_2_4g_base",
+            "b.p50_rssi_5g AS p50_rssi_5g_base",
+            "b.p95_rssi_2_4g AS p95_rssi_2_4g_base",
+            "b.p95_rssi_5g AS p95_rssi_5g_base",
+            "b.p90_phy_rate_2_4g AS p90_phy_rate_2_4g_base",
+            "b.p90_phy_rate_5g AS p90_phy_rate_5g_base",
+            "b.rssi_score_2_4g AS rssi_score_2_4g_base",
+            "b.rssi_score_5g AS rssi_score_5g_base",
+            "b.phy_rate_score_2_4g AS phy_rate_score_2_4g_base",
+            "b.phy_rate_score_5g AS phy_rate_score_5g_base",
+            "v.snr_range AS snr_range_variation",
+            "v.son_count AS son_count_variation",
+            "v.phy_rate_range_2_4g AS phy_rate_range_2_4g_variation",
+            "v.phy_rate_range_5g AS phy_rate_range_5g_variation",
+            "LEAST(b.final_rssi_score, b.final_phy_rate_score) AS base_score",
+            "v.variation_score",
+            """CASE
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score >= 4 THEN 'Excellent'
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score = 3 THEN 'Good'
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score = 2 THEN 'Fair'
+            ELSE 'Poor'
+            END AS station_score""",
+            """CASE
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score >= 4 THEN 4
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score = 3 THEN 3
+            WHEN LEAST(b.final_rssi_score, b.final_phy_rate_score) - v.variation_score = 2 THEN 2
+            ELSE 1
+            END AS station_score_num"""
+        )
+
+
+        output_df.write.mode("overwrite").parquet(f"{self.output_path}/date={self.date_str}/hour={self.hour_str}")
+
+
+class wifi_score_hourly:
+    global hdfs_pd, hdfs_pa
+    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    hdfs_pa =  'hdfs://njbbepapa1.nss.vzwnet.com:9000'
+    def __init__(self,
+                 spark, 
+                 date_str,
+                 hour_str,
+                 source_df,
+                 station_history_path = hdfs_pa + f"/sha_data/StationHistory/",
+                 device_groups_path = hdfs_pa + f"/sha_data/DeviceGroups/",
+                 output_path = f"/sha_data/vz-bhr-athena/reports/bhr_wifi_score_hourly_report_v1/"
+                 ):
+        self.spark = spark
+        self.data_consumption_df = None
+        self.date_str = date_str
+        self.hour_str = hour_str
+        self.source_df = source_df
         self.station_history_path = station_history_path
-        self.deviceGroup_path = deviceGroup_path
-        self.df_rssi_path = df_rssi_path
-        self.df_phyrate_path = df_phyrate_path
-        self.wifiscore_path = wifiscore_path
+        self.device_groups_path = device_groups_path
+        self.output_path = output_path
 
-    def load_data(self):
-        self.model_sn_df = spark.read.parquet( self.deviceGroup_path )\
-                                .withColumn("features", explode("Group_Data_sys_info"))\
-                                .select(
-                                    "features.sn",
-                                    col("features.model").alias("model_name"),
-                                    col("Tplg_Data_fw_ver").alias("firmware")
-                                )\
-                                .distinct()\
-                                .groupBy("sn", "model_name").agg(F.max("firmware").alias("firmware"))
-        
-        self.df_dg = spark.read.parquet( self.deviceGroup_path )\
-                            .withColumn("sn", F.regexp_extract(F.col("rowkey"), r'-(\w+)', 1))\
-
-        self.df_owl = spark.read.parquet( self.owl_path )\
-                            .withColumn("sn", F.regexp_extract(F.col("rowkey"), r'-(\w+)_', 1))\
-                            .withColumn("datetime", F.from_unixtime(F.col("ts") / 1000).cast("timestamp"))
-        
-        self.df_sh = spark.read.parquet(self.station_history_path)\
-                            .withColumn("sn", F.regexp_extract(F.col("rowkey"), r'-(\w+)_', 1))\
-                            .withColumn("datetime", F.from_unixtime(F.col("ts") / 1000).cast("timestamp"))
-
-    def calculate_ip_changes(self, df_owl = None, df_restart = None, ip_change_file_path_template = None):
-        if df_owl is None:
-            df_owl = self.df_owl
-        if ip_change_file_path_template is None:
-            ip_change_file_path_template = hdfs_pd + "/user/ZheS/wifi_score_v4/time_window/{}/ip_change_daily_df/"
-
-        previous_day = self.date_val - timedelta(1)
-        lookback_days = 10
-        date_range_list = [(previous_day - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
-        historical_ip_change_df = process_parquet_files_for_date_range(date_range_list, ip_change_file_path_template)
-        historical_ip_change_df = historical_ip_change_df.groupby("sn")\
-                                                        .agg(F.sum("no_ip_changes").alias("no_ip_changes"))
-
-        ip_change_cat_df = (
-            historical_ip_change_df.withColumn(
-                                        "ip_change_category",
-                                        F.when(F.col("no_ip_changes") > 6, "Poor")
-                                        .when(F.col("no_ip_changes").between(4, 6), "Fair")
-                                        .when(F.col("no_ip_changes").between(1, 3), "Good")
-                                        .when(F.col("no_ip_changes") == 0, "Excellent")
-                                        .otherwise("Unknown")
-                                    )
-
-                        )
-
-        return ip_change_cat_df
-    
-    def calculate_airtime(self, airtime_daily_template = None):
+    def read_data_consumption(self, date_part, hour_part):
+        self.spark.read.parquet(
+            f"{self.station_history_path}/date={date_part}/hour={hour_part}"
+        )\
+         .withColumn("date", F.lit(date_part))\
+         .withColumn("hour", F.lit(hour_part))\
+         .createOrReplaceTempView('bhrx_stationhistory_version_001')
             
-        if airtime_daily_template is None:
-            airtime_daily_template = hdfs_pd + "/user/ZheS/wifi_score_v4/time_window/{}/airtime_daily_df/"
-
-        lookback_days = 7
-        date_range_list = [(self.date_val - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
-        historical_airtime_df = process_parquet_files_for_date_range(date_range_list, airtime_daily_template)
-        historical_airtime_df = historical_airtime_df.groupby("sn")\
-                                                        .agg(F.sum("no_poor_airtime").alias("no_poor_airtime"))
-
-        airtime_df = (
-            historical_airtime_df.withColumn(
-                                                "Airtime_Utilization_Category",
-                                                F.when(F.col("no_poor_airtime") > 200, "Poor") 
-                                                .when((F.col("no_poor_airtime") >= 75) & (F.col("no_poor_airtime") <= 200), "Fair") 
-                                                .when((F.col("no_poor_airtime") >= 26) & (F.col("no_poor_airtime") <= 74), "Good")  
-                                                .when(F.col("no_poor_airtime") >= 0, "Excellent") 
-                                                .otherwise("Unknown")  
-                                            )
-                        )
-
-        return airtime_df
-
-    def calculate_steer(self, df_sh = None):
-        if df_sh is None:
-            df_sh = self.df_sh
+        print(f"Reading data consumption for date={date_part}, hour={hour_part}")
         
-        df_bandsteer = df_sh.select( "sn",
-                                    col("Diag_Result_band_steer.sta_type").alias("sta_type"),
-                                    col("Diag_Result_band_steer.action").alias("action"),
-                                    )\
-                            .filter(  ( F.col("sta_type") == "2" )  )
+        data_consumption_query = f"""
+            SELECT
+                regexp_extract(rowkey, '-([^-_]+)_', 1) as sn,
+                station_data_connect_data.station_mac as station_mac,
+                date,
+                hour,
+                SUM(CAST(station_data_connect_data.bs as DECIMAL(38, 0)) + 
+                    CAST(station_data_connect_data.br as DECIMAL(38, 0))) as total_bytes
+            FROM bhrx_stationhistory_version_001
+            WHERE date = '{date_part}'
+                AND hour = '{hour_part}'
+                AND station_data_connect_data IS NOT NULL
+            GROUP BY
+                regexp_extract(rowkey, '-([^-_]+)_', 1),
+                station_data_connect_data.station_mac,
+                date,
+                hour
+            HAVING SUM(CAST(station_data_connect_data.bs AS DECIMAL(38, 0)) +
+            CAST(station_data_connect_data.br AS DECIMAL(38, 0))) < 1875000000;
+        """
+
+        data_consumption_df = self.spark.sql(data_consumption_query)
+
+
+        return data_consumption_df
+
+    def calculate_speed_score(self, source_df, data_consumption_df):
+        source_df.createOrReplaceTempView('station_hourly_data_speed')
+
+        station_hourly_data_with_count = self.spark.sql('''
+            SELECT
+                *,
+                COUNT(*) OVER (PARTITION BY sn, station_mac, date, hour) as record_count
+            FROM station_hourly_data_speed
+        ''')
+        spark.catalog.dropTempView('station_hourly_data_speed')
+
+        #station_hourly_data_with_count.cache()
+        station_hourly_data_with_count.createOrReplaceTempView('station_hourly_data_cached_speed')
+
+        combined_base_score = self.spark.sql('''
+            WITH
+            pivoted_data AS (
+                SELECT
+                sn, station_mac, date, hour,
+                MAX(model) as model,
+                MAX(mobility_status) as mobility_status,
+                MAX(station_name) as station_name,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(tx_phy_rate AS DOUBLE) END, 0.9) AS p90_phy_rate_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(tx_phy_rate AS DOUBLE) END, 0.9) AS p90_phy_rate_5g
+                FROM station_hourly_data_cached_speed
+                WHERE record_count >= 9
+                and CAST(tx_phy_rate AS DOUBLE) > 24
+                GROUP BY sn, station_mac, date, hour
+            ),
+            base_scores AS (
+                SELECT
+                *,
+                CASE 
+                    WHEN p90_phy_rate_2_4g > 120 THEN 4 
+                    WHEN p90_phy_rate_2_4g BETWEEN 101 AND 120 THEN 3 
+                    WHEN p90_phy_rate_2_4g BETWEEN 80 AND 100 THEN 2 
+                    WHEN p90_phy_rate_2_4g < 80 THEN 1 
+                END AS phy_rate_score_2_4g,
+                CASE 
+                    WHEN p90_phy_rate_5g > 400 THEN 4 
+                    WHEN p90_phy_rate_5g BETWEEN 301 AND 400 THEN 3 
+                    WHEN p90_phy_rate_5g BETWEEN 200 AND 300 THEN 2 
+                    WHEN p90_phy_rate_5g < 200 THEN 1 
+                END AS phy_rate_score_5g
+                FROM pivoted_data
+            )
+            SELECT
+            *,
+            (CASE WHEN phy_rate_score_2_4g IS NOT NULL THEN phy_rate_score_2_4g ELSE 0 END +
+            CASE WHEN phy_rate_score_5g IS NOT NULL THEN phy_rate_score_5g ELSE 0 END) /
+            NULLIF((CASE WHEN phy_rate_score_2_4g IS NOT NULL THEN 1 ELSE 0 END +
+                    CASE WHEN phy_rate_score_5g IS NOT NULL THEN 1 ELSE 0 END), 0) AS station_base_score_step1_speed
+            FROM base_scores
+        ''')
         
-        df_bandsteer = df_bandsteer.groupBy("sn")\
-                                    .agg(
-                                        count(  when(  (col("action") == "2")&( F.col("sta_type") == "2" ) , True)).alias("band_success_count"),
-                                    )
+        combined_base_score = combined_base_score.alias("bs").join(
+            data_consumption_df.alias("dc"),
+            on=['sn', 'station_mac', 'date', 'hour'], 
+            how='left_outer'
+        ).selectExpr(
+            "bs.*",
+            "dc.total_bytes"
+        )
 
-        df_apsteer = df_sh.select( "sn",
-                                    col("Diag_Result_ap_steer.sta_type").alias("sta_type"),
-                                    col("Diag_Result_ap_steer.action").alias("action"),
-                                    )\
-                            .filter(  ( F.col("sta_type") == "2" )  )
+        window_spec_rank_per_sn = Window.partitionBy("sn", "date", "hour").orderBy(F.desc("total_bytes"))
+        stations_with_rank_per_sn = combined_base_score.withColumn("rank_per_sn", F.rank().over(window_spec_rank_per_sn))
+
+        avg_top_5_per_sn_df = stations_with_rank_per_sn.filter(F.col("rank_per_sn") <= 5) \
+                                                        .groupBy("sn", "date", "hour") \
+                                                        .agg(F.avg("station_base_score_step1_speed").alias("avg_t_per_sn"))
         
-        df_apsteer = df_apsteer.groupBy("sn")\
-                                .agg(
-                                    count(  when(  (col("action") == "2")&( F.col("sta_type") == "2" ) , True)).alias("ap_success_count"),
-                                )
+        avg_rest_per_sn_df = stations_with_rank_per_sn.filter(F.col("rank_per_sn") > 5) \
+                                                    .groupBy("sn", "date", "hour") \
+                                                    .agg(F.avg("station_base_score_step1_speed").alias("avg_b_per_sn"))
 
+        temp_df_with_averages = stations_with_rank_per_sn.alias("s").join(
+            avg_top_5_per_sn_df.alias("t"),
+            on=["sn", "date", "hour"],
+            how="left_outer"
+        ).join(
+            avg_rest_per_sn_df.alias("b"),
+            on=["sn", "date", "hour"],
+            how="left_outer"
+        ).selectExpr(
+            "s.*",
+            "t.avg_t_per_sn",
+            "b.avg_b_per_sn"
+        )
 
-        df_distinct_rowkey_count = df_sh.groupBy("sn")\
-                                        .agg( F.countDistinct("rowkey").alias("distinct_rowkey_count")  )
+        output_df_with_weighted_base = temp_df_with_averages.withColumn(
+            "weighted_avg_base_score_speed",
+            F.round(
+                (F.coalesce(F.col("avg_t_per_sn"), F.lit(0.0)) * 0.80) +
+                (F.coalesce(F.col("avg_b_per_sn"), F.lit(0.0)) * 0.20),
+                2
+            )
+        )
 
-        son_df = df_bandsteer.join(df_apsteer, on="sn", how="full_outer")\
-                            .withColumn(
-                                "steer_start_count",
-                                F.coalesce(col("band_success_count"), lit(0)) + F.coalesce(col("ap_success_count"), lit(0))
-                            )\
-                            .withColumn(
-                                        "steer_start_category",
-                                        F.when(F.col("steer_start_count") > 60, "Poor")
-                                        .when((F.col("steer_start_count") >= 31) & (F.col("steer_start_count") <= 60), "Fair")
-                                        .when((F.col("steer_start_count") >= 11) & (F.col("steer_start_count") <= 30), "Good")
-                                        .when((F.col("steer_start_count").isNull() ) | (F.col("steer_start_count") <= 10), "Excellent")
-                                        .otherwise("Unknown")
-                                    )\
-                            .join( df_distinct_rowkey_count, "sn" )\
-                            .withColumn(
-                                "steer_start_perHome_count",
-                                F.col("steer_start_count")/F.col("distinct_rowkey_count")
-                            )\
-                            .withColumn(
-                                        "steer_start_perHome_category",
-                                        F.when(F.col("steer_start_perHome_count") > 3, "Poor")
-                                        .when((F.col("steer_start_perHome_count") > 2) & (F.col("steer_start_perHome_count") <= 3), "Fair")
-                                        .when((F.col("steer_start_perHome_count") > 1) & (F.col("steer_start_perHome_count") <= 2), "Good")
-                                        .when((F.col("steer_start_perHome_count").isNull() ) | (F.col("steer_start_perHome_count") <= 1), "Excellent")
-                                        .otherwise("Unknown")
-                            )
+        output_df_with_weighted_base = output_df_with_weighted_base.drop("rank_per_sn", "avg_t_per_sn", "avg_b_per_sn")
 
-        return son_df
+        variation_cal = self.spark.sql('''
+            WITH
+            variation_components AS (
+                SELECT
+                sn, station_mac, date, hour,
+                MAX(CAST(snr AS DOUBLE)) - MIN(CAST(snr AS DOUBLE)) as snr_range
+                FROM station_hourly_data_cached_speed
+                WHERE record_count >= 9
+                AND CAST(snr AS DOUBLE) BETWEEN 0 AND 50
+                GROUP BY sn, station_mac, date, hour
+            )
+            SELECT
+            sn, station_mac, date, hour,
+            snr_range,
+            CASE
+                WHEN snr_range > 13 THEN 1
+                ELSE 0
+            END AS speed_variation_score
+            FROM variation_components
+        ''')
 
-    def calculate_restart(self, df_owl = None):
+        final_speed_score_df = output_df_with_weighted_base.alias("b").join(
+            variation_cal.alias("v"),
+            on=['sn', 'station_mac', 'date', 'hour'],
+            how='inner'
+        ).selectExpr(
+            "b.sn",
+            "b.station_mac",
+            "b.station_name",
+            "b.model",
+            "b.mobility_status",
+            "b.date",
+            "b.hour",
+            "b.p90_phy_rate_2_4g as p90_phy_rate_2_4g_speed",
+            "b.p90_phy_rate_5g as p90_phy_rate_5g_speed",  
+            "b.phy_rate_score_2_4g as phy_rate_score_2_4g_speed",
+            "b.phy_rate_score_5g as phy_rate_score_5g_speed",
+            "v.snr_range AS snr_range_variation",
+            "b.station_base_score_step1_speed as individual_station_avg_base_score_speed",
+            "b.weighted_avg_base_score_speed as home_weighted_avg_base_score_speed",
+            "v.speed_variation_score",
+            "(b.weighted_avg_base_score_speed - v.speed_variation_score) AS speed_score_num"
+        )
+
+        #station_hourly_data_with_count.unpersist()
+        self.spark.catalog.dropTempView('station_hourly_data_cached_speed')
+        return final_speed_score_df
+
+    def calculate_coverage_score(self, source_df, data_consumption_df):
+        source_df.createOrReplaceTempView('station_hourly_data_coverage')
+
+        station_hourly_data_with_count = self.spark.sql('''
+            SELECT
+                *,
+                COUNT(*) OVER (PARTITION BY sn, station_mac, date, hour) as record_count
+            FROM station_hourly_data_coverage
+        ''')
+        self.spark.catalog.dropTempView('station_hourly_data_coverage')
+
+        #station_hourly_data_with_count.cache()
+        station_hourly_data_with_count.createOrReplaceTempView('station_hourly_data_cached_coverage')
+
+        combined_base_score = self.spark.sql('''
+            WITH
+            pivoted_data AS (
+                SELECT
+                sn, station_mac, date, hour,
+                MAX(model) as model,
+                MAX(mobility_status) as mobility_status,
+                MAX(station_name) as station_name,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '2.4G%' THEN CAST(rssi AS DOUBLE) END, 0.90) AS p90_rssi_2_4g,
+                APPROX_PERCENTILE(CASE WHEN band LIKE '5G%' THEN CAST(rssi AS DOUBLE) END, 0.90) AS p90_rssi_5g
+                FROM station_hourly_data_cached_coverage
+                WHERE record_count >= 9
+                GROUP BY sn, station_mac, date, hour
+            ),
+            base_scores AS (
+                SELECT
+                *,
+                CASE 
+                    WHEN p90_rssi_2_4g >= -55 THEN 4 
+                    WHEN p90_rssi_2_4g BETWEEN -70 AND -56 THEN 3 
+                    WHEN p90_rssi_2_4g BETWEEN -79 AND -71 THEN 2 
+                    WHEN p90_rssi_2_4g < -79 THEN 1 
+                END AS rssi_score_2_4g,
+                CASE 
+                    WHEN p90_rssi_5g >= -55 THEN 4 
+                    WHEN p90_rssi_5g BETWEEN -70 AND -56 THEN 3 
+                    WHEN p90_rssi_5g BETWEEN -77 AND -71 THEN 2 
+                    WHEN p90_rssi_5g < -77 THEN 1 
+                END AS rssi_score_5g
+                FROM pivoted_data
+            )
+            SELECT
+            *,
+            (CASE WHEN rssi_score_2_4g IS NOT NULL THEN rssi_score_2_4g ELSE 0 END +
+            CASE WHEN rssi_score_5g IS NOT NULL THEN rssi_score_5g ELSE 0 END) /
+            NULLIF((CASE WHEN rssi_score_2_4g IS NOT NULL THEN 1 ELSE 0 END +
+                    CASE WHEN rssi_score_5g IS NOT NULL THEN 1 ELSE 0 END), 0) AS station_base_score_step1_coverage
+            FROM base_scores
+        ''')
         
-        if df_owl is None:
-            df_owl = self.df_owl
+        combined_base_score = combined_base_score.alias("bs").join(
+            data_consumption_df.alias("dc"),
+            on=['sn', 'station_mac', 'date', 'hour'], 
+            how='left_outer'
+        ).selectExpr(
+            "bs.*",
+            "dc.total_bytes"
+        )
 
-        # Number of reboots per home
-        def categorize_reboots_per_home(column):
-            return F.when(F.col(column) >= 5, "Poor")\
-                    .when(F.col(column) == 4, "Fair")\
-                    .when((F.col(column) >= 2) & (F.col(column) <= 3), "Good")\
-                    .when(F.col(column) >= 0, "Excellent")\
-                    .when(F.col(column).isNull(), "Excellent")\
-                    .otherwise(None)
+        window_spec_rank_per_sn = Window.partitionBy("sn", "date", "hour").orderBy(F.desc("total_bytes"))
+        stations_with_rank_per_sn = combined_base_score.withColumn("rank_per_sn", F.rank().over(window_spec_rank_per_sn))
 
-        # Number of modem resets per home
-        def categorize_modem_resets_per_home(column):
-            return F.when(F.col(column) >= 5, "Poor")\
-                    .when(F.col(column) == 4, "Fair")\
-                    .when((F.col(column) >= 2) & (F.col(column) <= 3), "Good")\
-                    .when(F.col(column) >= 0, "Excellent")\
-                    .when(F.col(column).isNull(), "Excellent")\
-                    .otherwise(None)
-
-        # Number of reboots initiated via customer
-        def categorize_customer_initiated_reboots(column):
-            return F.when(F.col(column) >= 3, "Poor")\
-                    .when(F.col(column) == 2, "Fair")\
-                    .when(F.col(column) == 1, "Good")\
-                    .when(F.col(column) == 0, "Excellent")\
-                    .when(F.col(column).isNull(), "Excellent")\
-                    .otherwise(None)
-
-        restart_daily_file_path_template = hdfs_pd + "/user/ZheS/wifi_score_v4/time_window/{}/restart_daily_df/"
-        previous_day = self.date_val
-        lookback_days = 30
-        date_range_list = [(previous_day - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
-        historical_restart_daily_df = process_parquet_files_for_date_range(date_range_list, restart_daily_file_path_template)\
-                                                .na.fill(0, subset=["num_mdm_crashes","num_user_reboots","num_total_reboots"])
+        avg_top_5_per_sn_df = stations_with_rank_per_sn.filter(F.col("rank_per_sn") <= 5) \
+                                                        .groupBy("sn", "date", "hour") \
+                                                        .agg(F.avg("station_base_score_step1_coverage").alias("avg_t_per_sn"))
         
-        historical_restart_daily_df = (
-                    historical_restart_daily_df.groupby("sn")\
-                                    .agg( F.sum("num_mdm_crashes").alias("mdm_resets_count"),
-                                            F.sum("num_user_reboots").alias("user_reboot_count"),
-                                            F.sum("num_total_reboots").alias("total_reboots_count"),
-                                )
-                    )
+        avg_rest_per_sn_df = stations_with_rank_per_sn.filter(F.col("rank_per_sn") > 5) \
+                                                    .groupBy("sn", "date", "hour") \
+                                                    .agg(F.avg("station_base_score_step1_coverage").alias("avg_b_per_sn"))
 
-        df_start = historical_restart_daily_df\
-                        .withColumn("reboot_category", categorize_reboots_per_home("total_reboots_count"))\
-                        .withColumn("modem_reset_category", categorize_modem_resets_per_home("mdm_resets_count"))\
-                        .withColumn("customer_reboot_category", categorize_customer_initiated_reboots("user_reboot_count"))
-        
-        return df_start
+        temp_df_with_averages = stations_with_rank_per_sn.alias("s").join(
+            avg_top_5_per_sn_df.alias("t"),
+            on=["sn", "date", "hour"],
+            how="left_outer"
+        ).join(
+            avg_rest_per_sn_df.alias("b"),
+            on=["sn", "date", "hour"],
+            how="left_outer"
+        ).selectExpr(
+            "s.*",
+            "t.avg_t_per_sn",
+            "b.avg_b_per_sn"
+        )
 
-    def calculate_rssi(self, df_sh = None):
-        if df_sh is None:
-            df_sh = self.df_sh
+        output_df_with_weighted_base = temp_df_with_averages.withColumn(
+            "weighted_avg_base_score_coverage",
+            F.round(
+                (F.coalesce(F.col("avg_t_per_sn"), F.lit(0.0)) * 0.80) +
+                (F.coalesce(F.col("avg_b_per_sn"), F.lit(0.0)) * 0.20),
+                2
+            )
+        )
 
-        df_flattened = df_sh.withColumn("connect_type", F.col("Station_Data_connect_data.connect_type"))\
-                            .withColumn(
-                                        "connect_type",
-                                        F.when(F.col("connect_type").like("2.4G%"), "2_4G")
-                                        .when(F.col("connect_type").like("5G%"), "5G")
-                                        .when(F.col("connect_type").like("6G%"), "6G")
-                                        .otherwise(F.col("connect_type"))  
-                                    )\
-                            .withColumn("signal_strength", F.col("Station_Data_connect_data.signal_strength"))\
-                            .withColumn("byte_send", F.col("Station_Data_connect_data.diff_bs"))\
-                            .withColumn("byte_received", F.col("Station_Data_connect_data.diff_br"))\
-                            .filter( col("signal_strength").isNotNull() )\
-                            .withColumn("signal_strength_2_4GHz", F.when(F.col("connect_type") == "2_4G", F.col("signal_strength")))\
-                            .withColumn("signal_strength_5GHz",  F.when(F.col("connect_type") == "5G", F.col("signal_strength")))\
-                            .withColumn("signal_strength_6GHz", F.when(F.col("connect_type") == "6G", F.col("signal_strength")) )\
-                            .select("sn","rowkey","ts","connect_type","signal_strength", "signal_strength_2_4GHz","signal_strength_5GHz","signal_strength_6GHz",
-                                    "byte_send","byte_received")
-        
-        thresholds = {
-                "2_4GHz": {"Poor": -78, "Fair": -71, "Good": -56, },
-                "5GHz": {"Poor": -75, "Fair": -71, "Good": -56, },
-                "6GHz": {"Poor": -70, "Fair": -65, "Good": -56, }
-            }
+        output_df_with_weighted_base = output_df_with_weighted_base.drop("rank_per_sn", "avg_t_per_sn", "avg_b_per_sn")
 
+        variation_cal = self.spark.sql('''
+            WITH
+            variation_components AS (
+                SELECT
+                sn, station_mac, date, hour
+                FROM station_hourly_data_cached_coverage
+                WHERE record_count >= 9
+                GROUP BY sn, station_mac, date, hour
+            )
+            SELECT
+            sn, station_mac, date, hour,
+            0 AS rssi_range,
+            0 AS coverage_variation_score
+            FROM variation_components
+        ''')
 
-        def categorize_signal(df, signal_col, freq_band):
+        final_coverage_score_df = output_df_with_weighted_base.alias("b").join(
+            variation_cal.alias("v"),
+            on=['sn', 'station_mac', 'date', 'hour'],
+            how='inner'
+        ).selectExpr(
+            "b.sn",
+            "b.station_mac",
+            "b.station_name",
+            "b.model",
+            "b.mobility_status",
+            "b.date",
+            "b.hour",
+            "b.p90_rssi_2_4g",
+            "b.p90_rssi_5g",
+            "b.rssi_score_2_4g",
+            "b.rssi_score_5g",
+            "v.rssi_range AS rssi_range_variation", 
+            "b.station_base_score_step1_coverage as individual_station_avg_base_score_coverage",
+            "b.weighted_avg_base_score_coverage as home_weighted_avg_base_score_coverage",
+            "v.coverage_variation_score", 
+            "(b.weighted_avg_base_score_coverage - v.coverage_variation_score) AS coverage_score_num"
+        )
 
-            return df.withColumn(f"category_{freq_band}", F.when(F.col(signal_col) < thresholds[freq_band]["Poor"], "Poor")
-                                                            .when(F.col(signal_col).between(thresholds[freq_band]["Poor"], thresholds[freq_band]["Fair"]), "Fair")
-                                                            .when(F.col(signal_col).between(thresholds[freq_band]["Fair"] - 1, thresholds[freq_band]["Good"]), "Good")
-                                                            .when(F.col(signal_col) > thresholds[freq_band]["Good"], "Excellent")
-                                                            .otherwise("No Data"))
-                
-        df_categorized = categorize_signal(df_flattened, "signal_strength_2_4GHz", "2_4GHz")
-        df_categorized = categorize_signal(df_categorized, "signal_strength_5GHz", "5GHz")
-        df_categorized = categorize_signal(df_categorized, "signal_strength_6GHz", "6GHz")
+        #station_hourly_data_with_count.unpersist()
+        self.spark.catalog.dropTempView('station_hourly_data_cached_coverage')
+        return final_coverage_score_df
 
-        df_grouped = df_categorized.groupBy("sn", "rowkey")\
-                                    .agg(
-                                            F.count("*").alias("total_count_rssi"),
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Poor", 1).otherwise(0)).alias("poor_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Poor", 1).otherwise(0)).alias("poor_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Poor", 1).otherwise(0)).alias("poor_count_6GHz"),
-                                            
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Fair", 1).otherwise(0)).alias("fair_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Fair", 1).otherwise(0)).alias("fair_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Fair", 1).otherwise(0)).alias("fair_count_6GHz"),
-                                        
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Good", 1).otherwise(0)).alias("good_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Good", 1).otherwise(0)).alias("good_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Good", 1).otherwise(0)).alias("good_count_6GHz"),
-                                        
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_6GHz"),
-                                            F.sum("byte_send").alias("byte_send"),
-                                            F.sum("byte_received").alias("byte_received")
-                                        )
+    def calculate_reliability_score(self, date_part, hour_part):
 
-        total_volume_window = Window.partitionBy("sn") 
-        df_rowkey_rssi_category = df_grouped.withColumn("rssi_category_rowkey", 
-                                                        F.when(
-                                                                (F.col("poor_count_2_4GHz") >= 12) | (F.col("poor_count_5GHz") >= 12) | (F.col("poor_count_6GHz") >= 12), "Poor")
-                                                                .when((F.col("fair_count_2_4GHz") >= 12) | (F.col("fair_count_5GHz") >= 12) | (F.col("fair_count_6GHz") >= 12), "Fair")
-                                                                .when((F.col("good_count_2_4GHz") >= 12) | (F.col("good_count_5GHz") >= 12) | (F.col("good_count_6GHz") >= 12), "Good")
-                                                                .when((F.col("excellent_count_2_4GHz") >= 12) | (F.col("excellent_count_5GHz") >= 12) | (F.col("excellent_count_6GHz") >= 12), "Excellent")
-                                                                .otherwise("No Data")
-                                                    )\
-                                            .withColumn("volume",F.log( col("byte_send")+col("byte_received") ))\
-                                            .withColumn("total_volume", F.sum("volume").over(total_volume_window))\
-                                            .withColumn("weights", F.col("volume") / F.col("total_volume") )
-        try:
-            window_spec = Window.partitionBy("sn", "rowkey").orderBy(F.desc("count"))
-
-            self.df_connectType = self.df_sh.select( "rowkey",
-                                                                col("Station_Data_connect_data.station_name").alias("station_name"),
-                                                                col("Station_Data_connect_data.connect_type").alias("connect_type"), 
-                                                                    )\
-                                            .withColumn("sn", F.regexp_extract("rowkey", r"([A-Z]+\d+)", 1))\
-                                            .withColumn(
-                                                    "connect_type",
-                                                    F.when(F.col("connect_type").like("2.4G%"), "2_4G")
-                                                    .when(F.col("connect_type").like("5G%"), "5G")
-                                                    .when(F.col("connect_type").like("6G%"), "6G")
-                                                    .otherwise(F.col("connect_type"))  
-                                                )\
-                                            .filter(F.col("station_name").isNotNull() & F.col("connect_type").isNotNull())\
-                                            .groupBy("sn", "rowkey", "connect_type", "station_name").count()\
-                                            .withColumn("rank", F.rank().over(window_spec))\
-                                            .filter(F.col("rank") == 1).drop("rank", "count")
+        self.spark.read.parquet(
+            f"{self.device_groups_path}/date={date_part}/hour={hour_part}"
+        )\
+            .withColumn("date", F.lit(date_part))\
+            .withColumn("hour", F.lit(hour_part))\
+            .createOrReplaceTempView('bhrx_devicegroups_version_001')
 
 
+        reliability_query = f"""
+                                SELECT
+                                    t1.date,  
+                                    t1.hour,  
+                                    regexp_extract(t1.rowkey, '-([^-_]+)', 1) as sn,
+                                    APPROX_PERCENTILE(CAST(t.radio_info._2_4g.airtime_util AS INT), 0.90) AS p90_airtime_util_2_4g
+                                FROM
+                                    bhrx_devicegroups_version_001 AS t1  
+                                LATERAL VIEW EXPLODE(t1.group_diag_history_radio_wifi_info) t AS radio_info  
+                                WHERE
+                                    t1.group_diag_history_radio_wifi_info IS NOT NULL
+                                    AND t.radio_info._2_4g.enable = '1'
+                                    AND t.radio_info._2_4g.airtime_util IS NOT NULL
+                                    AND t.radio_info._2_4g.airtime_util <> ''
+                                    AND CAST(t.radio_info._2_4g.airtime_util AS INT) BETWEEN 0 AND 100
+                                GROUP BY
+                                    t1.date, t1.hour, regexp_extract(t1.rowkey, '-([^-_]+)', 1)
+                            """
 
-            df_rowkey_rssi_category.join(self.df_connectType, ["sn","rowkey"], "left") \
-                                    .withColumn(
-                                                    "date", lit(self.date_val.strftime('%Y-%m-%d')))\
-                                    .write\
-                                    .mode("overwrite")\
-                                    .parquet( self.df_rssi_path  )
-        
-        except:
-            print( "failed df_rowkey_rssi_category")
-        df_rowkey_rssi_numeric = df_rowkey_rssi_category.withColumn(
-                                                                    "rssi_numeric_rowkey",
-                                                                    F.when(F.col("rssi_category_rowkey") == "Poor", 1)
-                                                                    .when(F.col("rssi_category_rowkey") == "Fair", 2)
-                                                                    .when(F.col("rssi_category_rowkey") == "Good", 3)
-                                                                    .when(F.col("rssi_category_rowkey") == "Excellent", 4)
-                                                                )\
-                                                        .groupBy("sn")\
-                                                        .agg(  
-                                                            F.round(F.sum(col("rssi_numeric_rowkey") * col("weights")), 4).alias("rssi_numeric"),  
-                                                        )
-        
-        df_final = df_rowkey_rssi_numeric.withColumn( "RSSI_category", 
-                                                    F.when(F.col("rssi_numeric") <= 1.5, "Poor")\
-                                                    .when((F.col("rssi_numeric") > 1.5) & (F.col("rssi_numeric") <= 2.5), "Fair")\
-                                                    .when((F.col("rssi_numeric") > 2.5) & (F.col("rssi_numeric") <= 3.5), "Good")\
-                                                    .when(F.col("rssi_numeric") > 3.5, "Excellent")  )
-
-        return df_final
-    
-    def calculate_phyrate(self, df_sh = None):
-        if df_sh is None:
-            df_sh = self.df_sh
-            
-        df_flattened = df_sh.withColumn("connect_type", F.col("Station_Data_connect_data.connect_type"))\
-                            .withColumn(
-                                        "connect_type",
-                                        F.when(F.col("connect_type").like("2.4G%"), "2_4G")
-                                        .when(F.col("connect_type").like("5G%"), "5G")
-                                        .when(F.col("connect_type").like("6G%"), "6G")
-                                        .otherwise(F.col("connect_type"))  
-                                    )\
-                            .filter( col("connect_type").isin( ["2_4G","5G","6G"]) )\
-                            .withColumn("byte_send", F.col("Station_Data_connect_data.diff_bs"))\
-                            .withColumn("byte_received", F.col("Station_Data_connect_data.diff_br"))\
-                            .withColumn("tx_link_rate", F.col("Station_Data_connect_data.tx_link_rate"))\
-                            .withColumn("tx_link_rate", F.regexp_replace(F.col("tx_link_rate"), "Mbps", "") )\
-                            .withColumn("tx_link_rate_2_4GHz", F.when(F.col("connect_type") == "2_4G", F.col("tx_link_rate")))\
-                            .withColumn("tx_link_rate_5GHz",  F.when(F.col("connect_type") == "5G", F.col("tx_link_rate")))\
-                            .withColumn("tx_link_rate_6GHz", F.when(F.col("connect_type") == "6G", F.col("tx_link_rate")) )\
-                            .select("sn","rowkey","ts","connect_type","tx_link_rate", "tx_link_rate_2_4GHz","tx_link_rate_5GHz","tx_link_rate_6GHz",
-                                     "byte_send","byte_received")
-
-        thresholds = {
-                "2_4GHz": {"Poor": 80, "Fair": 100, "Good": 120, },
-                "5GHz": {"Poor": 200, "Fair": 300, "Good": 500, },
-                "6GHz": {"Poor": 200, "Fair": 300, "Good": 500, }
-            }
-
-        def categorize_signal(df, phyrate_col, freq_band):
-    
-            return df.withColumn(f"category_{freq_band}", 
-                                    F.when(F.col(phyrate_col) < thresholds[freq_band]["Poor"], "Poor")
-                                    .when((F.col(phyrate_col) >= thresholds[freq_band]["Poor"]) & (F.col(phyrate_col) < thresholds[freq_band]["Fair"]), "Fair")
-                                    .when((F.col(phyrate_col) >= thresholds[freq_band]["Fair"]) & (F.col(phyrate_col) < thresholds[freq_band]["Good"]), "Good")
-                                    .when(F.col(phyrate_col) >= thresholds[freq_band]["Good"], "Excellent")
-                                    .otherwise("No Data")
-                                    )
+        reliability_df = self.spark.sql(reliability_query)
 
 
-        df_categorized = categorize_signal(df_flattened, "tx_link_rate_2_4GHz", "2_4GHz")
-        df_categorized = categorize_signal(df_categorized, "tx_link_rate_5GHz", "5GHz")
-        df_categorized = categorize_signal(df_categorized, "tx_link_rate_6GHz", "6GHz")
+        reliability_score_df = reliability_df.withColumn(
+            "reliability_score_num",
+            F.when(F.col("p90_airtime_util_2_4g") < 40, 4)
+            .when(F.col("p90_airtime_util_2_4g").between(40, 50), 3)
+            .when(F.col("p90_airtime_util_2_4g").between(50, 70), 2)
+            .otherwise(1) # > 70
+        )
+        return reliability_score_df.select("sn", "date", "hour", "p90_airtime_util_2_4g", "reliability_score_num")
 
-        df_grouped = df_categorized.groupBy("sn", "rowkey")\
-                                    .agg(
-                                            F.sum("byte_send").alias("byte_send"),
-                                            F.sum("byte_received").alias("byte_received"),
-                                            F.count("*").alias("total_count_phyrate"),
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Poor", 1).otherwise(0)).alias("poor_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Poor", 1).otherwise(0)).alias("poor_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Poor", 1).otherwise(0)).alias("poor_count_6GHz"),
-                                            
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Fair", 1).otherwise(0)).alias("fair_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Fair", 1).otherwise(0)).alias("fair_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Fair", 1).otherwise(0)).alias("fair_count_6GHz"),
-                                        
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Good", 1).otherwise(0)).alias("good_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Good", 1).otherwise(0)).alias("good_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Good", 1).otherwise(0)).alias("good_count_6GHz"),
-                                        
-                                            F.sum(F.when(F.col("category_2_4GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_2_4GHz"),
-                                            F.sum(F.when(F.col("category_5GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_5GHz"),
-                                            F.sum(F.when(F.col("category_6GHz") == "Excellent", 1).otherwise(0)).alias("excellent_count_6GHz")
-                                        )
+    def run(self):
+        self.data_consumption_df = self.read_data_consumption(self.date_str, str(self.hour_str).zfill(2))
+        self.coverage_score_df = self.calculate_coverage_score(self.source_df, self.data_consumption_df)
+        self.speed_score_df = self.calculate_speed_score(self.source_df, self.data_consumption_df)
+        self.reliability_score_df = self.calculate_reliability_score(self.date_str, str(self.hour_str).zfill(2))
 
-        total_volume_window = Window.partitionBy("sn") 
-        #If any "poor" count (for any band) is 12 or more, label as "Poor".
-        #If not, and any "fair" count is 12 or more, label as "Fair".
-        #If not, and any "good" count is 12 or more, label as "Good".
-        #If not, and any "excellent" count is 12 or more, label as "Excellent".
-        #If none of these counts are at least 12, label as "No Data".
-        df_rowkey_phyrate_category = df_grouped.withColumn("rowkey_phyrate_category", 
-                                                            F.when(
-                                                                    (F.col("poor_count_2_4GHz") >= 12) | (F.col("poor_count_5GHz") >= 12) | (F.col("poor_count_6GHz") >= 12), "Poor")
-                                                                    .when((F.col("fair_count_2_4GHz") >= 12) | (F.col("fair_count_5GHz") >= 12) | (F.col("fair_count_6GHz") >= 12), "Fair")
-                                                                    .when((F.col("good_count_2_4GHz") >= 12) | (F.col("good_count_5GHz") >= 12) | (F.col("good_count_6GHz") >= 12), "Good")
-                                                                    .when((F.col("excellent_count_2_4GHz") >= 12) | (F.col("excellent_count_5GHz") >= 12) | (F.col("excellent_count_6GHz") >= 12), "Excellent")
-                                                                    .otherwise("No Data")
-                                                        )\
-                                                .withColumn("volume",F.log( col("byte_send")+col("byte_received") ))\
-                                                .withColumn("total_volume", F.sum("volume").over(total_volume_window))\
-                                                .withColumn("weights", F.col("volume") / F.col("total_volume") )
-        try:
-            df_rowkey_phyrate_category.join(self.df_connectType, ["sn","rowkey"], "left") \
-                                        .withColumn(
-                                                    "date", lit(self.date_val.strftime('%Y-%m-%d')))\
-                                        .write.mode("overwrite")\
-                                        .parquet(
-                                                self.df_phyrate_path 
-                                            )
+        wifi_score_df = self.speed_score_df.alias("s").join(
+                self.coverage_score_df.alias("c"),
+                on=['sn', 'station_mac', 'date', 'hour', 'model', 'mobility_status', 'station_name'],
+                how='inner'
+            ).join(
+                self.reliability_score_df.alias("r"),
+                on=['sn', 'date', 'hour'],
+                how='left_outer'
+            ).selectExpr(
+                "s.sn",
+                "s.station_mac",
+                "s.station_name",
+                "s.model",
+                "s.mobility_status",
+                "s.date",
+                "s.hour",
+                "s.p90_phy_rate_2_4g_speed",
+                "s.p90_phy_rate_5g_speed",
+                "s.phy_rate_score_2_4g_speed",
+                "s.phy_rate_score_5g_speed",
+                "s.snr_range_variation", 
+                "s.home_weighted_avg_base_score_speed",
+                "s.speed_variation_score",
+                "s.speed_score_num",
+                "c.p90_rssi_2_4g",
+                "c.p90_rssi_5g",
+                "c.rssi_score_2_4g",
+                "c.rssi_score_5g",
+                "c.rssi_range_variation",
+                "c.home_weighted_avg_base_score_coverage",
+                "c.coverage_variation_score",
+                "c.coverage_score_num",
+                "r.p90_airtime_util_2_4g",
+                "r.reliability_score_num",
+                """
+                ROUND(
+                    (s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                    NULLIF(
+                        (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                        CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                        CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                    ), 2
+                ) AS wifi_score_num_unrounded
+                """,
+                """
+                CASE
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 3.5 THEN 4
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 2.5 THEN 3
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 1.5 THEN 2
+                    ELSE 1
+                END AS wifi_score_num
+                """,
+                """
+                CASE
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 3.5 THEN 'Excellent'
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 2.5 THEN 'Good'
+                    WHEN ((s.speed_score_num + c.coverage_score_num + COALESCE(r.reliability_score_num, 0)) /
+                        NULLIF(
+                            (CASE WHEN s.speed_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN c.coverage_score_num IS NOT NULL THEN 1 ELSE 0 END +
+                            CASE WHEN r.reliability_score_num IS NOT NULL THEN 1 ELSE 0 END), 0
+                        )) > 1.5 THEN 'Fair'
+                    ELSE 'Poor'
+                END AS wifi_score_category
+                """
+            )
 
-        except Exception as e:
-            error_message = ( f"df_rowkey_rssi_category v4 failed at {e}" )
-            print(error_message)
-        
-        df_rowkey_phyrate_numeric = df_rowkey_phyrate_category.withColumn(
-                                                                        "phyrate_numeric",
-                                                                        F.when(F.col("rowkey_phyrate_category") == "Poor", 1)
-                                                                        .when(F.col("rowkey_phyrate_category") == "Fair", 2)
-                                                                        .when(F.col("rowkey_phyrate_category") == "Good", 3)
-                                                                        .when(F.col("rowkey_phyrate_category") == "Excellent", 4)
-                                                                    )\
-                                                        .groupBy("sn")\
-                                                        .agg(  
-                                                            F.round(F.sum(col("phyrate_numeric") * col("weights")), 4).alias("phyrate_numeric"),  
-                                                        )
-                                                                    
-        df_final = df_rowkey_phyrate_numeric.withColumn( "phyrate_category", 
-                                                    F.when(F.col("phyrate_numeric") <= 1.5, "Poor")\
-                                                    .when((F.col("phyrate_numeric") > 1.5) & (F.col("phyrate_numeric") <= 2.5), "Fair")\
-                                                    .when((F.col("phyrate_numeric") > 2.5) & (F.col("phyrate_numeric") <= 3.5), "Good")\
-                                                    .when(F.col("phyrate_numeric") > 3.5, "Excellent")  )
-        return df_final
-
-    def calculate_sudden_drop(self, df_sh = None, date_val = None ):
-        
-        if df_sh is None:
-            df_sh = self.df_sh
-        if date_val is None:
-            date_val = self.date_val
-                
-        df = df_sh.withColumn("signal_strength", F.col("Station_Data_connect_data.signal_strength"))\
-                    .filter( col("signal_strength").isNotNull() )
-                
-        partition_columns = ["sn","rowkey"]
-        column_name = "signal_strength"
-        percentiles = [0.03, 0.1, 0.5, 0.9]
-        window_spec = Window().partitionBy(partition_columns) 
-
-        three_percentile = F.expr(f'percentile_approx({column_name}, {percentiles[0]})') 
-        ten_percentile = F.expr(f'percentile_approx({column_name}, {percentiles[1]})') 
-        med_percentile = F.expr(f'percentile_approx({column_name}, {percentiles[2]})') 
-        ninety_percentile = F.expr(f'percentile_approx({column_name}, {percentiles[3]})') 
-
-        df_outlier = df.withColumn('3%_val', three_percentile.over(window_spec))\
-                        .withColumn('10%_val', ten_percentile.over(window_spec))\
-                        .withColumn('50%_val', med_percentile.over(window_spec))\
-                        .withColumn('90%_val', ninety_percentile.over(window_spec))\
-                        .withColumn("lower_bound", col('10%_val')-2*(  col('90%_val') - col('10%_val') ) )\
-                        .withColumn("outlier", when( col("lower_bound") < col("3%_val"), col("lower_bound")).otherwise( col("3%_val") ))\
-                        .filter(col(column_name) > col("outlier"))
-
-        stationary_daily_df = df_outlier.withColumn("diff", col('90%_val') - col('50%_val') )\
-                                        .withColumn("stationarity", when( col("diff")<= 5, lit("1")).otherwise( lit("0") ))\
-                                        .groupby(partition_columns).agg(max("stationarity").alias("stationarity"))\
-                                        .filter( col("stationarity")>0 )
-
-        df_ts_station = df_sh.join( stationary_daily_df, ["sn","rowkey"])\
-                                .select( "sn","rowkey", "datetime", col("Station_Data_connect_data.station_mac").alias("station_mac") )\
-                                .filter( col("station_mac").isNotNull() )\
-                                .groupBy("sn","datetime")\
-                                .agg(  F.count("station_mac").alias("station_cnt") )
-
-        window_spec = Window.partitionBy("sn").orderBy("datetime")
-        df_lagged = df_ts_station.withColumn( "prev_station_cnt",  F.lag("station_cnt").over(window_spec) )\
-                                .withColumn( "drop_diff", F.col("prev_station_cnt") - F.col("station_cnt") )\
-                                .filter(  F.col("drop_diff") > 3 )
-
-        df_result = df_lagged.groupBy("sn")\
-                            .agg( F.count("drop_diff").alias("no_sudden_drop") )\
-                            .withColumn( "sudden_drop_category", 
-                                        F.when(F.col("no_sudden_drop") >= 2, "Poor")\
-                                        .when( F.col("no_sudden_drop") == 1, "Fair")\
-                                        .when( F.col("no_sudden_drop").isNull(), "Excellent")\
-                                        .otherwise("Good")
-                                    )
-
-        return df_result
-
-    def join_all(self):
-
-
-        ip_change_cat_df = self.calculate_ip_changes()
-        son_df = self.calculate_steer()
-        df_restart = self.calculate_restart()
-        df_rssi = self.calculate_rssi()
-        df_phyrate = self.calculate_phyrate()
-        df_airtime = self.calculate_airtime()
-        df_sudden_drop = self.calculate_sudden_drop()
-
-        categories_to_replace = ["ip_change_category",  
-                                 "steer_start_category","steer_start_perHome_category",
-                                "customer_reboot_category", "reboot_category","modem_reset_category",
-                                 "sudden_drop_category",
-                                 #"RSSI_category",
-                                 #"phyrate_category",
-                                 "Airtime_Utilization_Category"]
-        numerics_to_replace = ["no_ip_changes",
-                               "steer_start_count","steer_start_perHome_count",
-                                "user_reboot_count","total_reboots_count","mdm_resets_count",
-                               "no_sudden_drop",
-                               #"rssi_numeric",
-                               #"phyrate_numeric",
-                               "no_poor_airtime",]
-        
-        self.df_full_joined = ip_change_cat_df.join(son_df, on="sn", how="full_outer")\
-                                        .join(df_restart, on="sn", how="full_outer")\
-                                        .join(df_rssi, on="sn", how="full_outer")\
-                                        .join(df_phyrate, on="sn", how="full_outer")\
-                                        .join(df_airtime, on="sn", how="full_outer")\
-                                        .join(df_sudden_drop, on="sn", how="full_outer")\
-                                        .distinct()\
-                                        .withColumn("day", F.lit(F.date_format(F.lit(self.date_val), "MM-dd-yyyy")))\
-                                        .na.fill("Excellent", subset=categories_to_replace)\
-                                        .na.fill(0, subset=numerics_to_replace)\
-                                        .join(self.model_sn_df, "sn" )
-
-
-    def get_score(self):
-        self.load_data()
-        self.join_all()
-        df_numeric = self.df_full_joined
-        # convert categorical to numerical
-        def convert_to_numeric(df, col_name):
-            return df.withColumn(f"{col_name}_numeric", F.when(F.col(col_name) == "Poor", 1)
-                                                        .when(F.col(col_name) == "Fair", 2)
-                                                        .when(F.col(col_name) == "Good", 3)
-                                                        .when(F.col(col_name) == "Excellent", 4)
-                                                        .otherwise(None))
-        def convert_to_categorical(df, col_name):
-            return df.withColumn(col_name, 
-                                F.when(F.col(col_name) < 1.5, "Poor")
-                                .when((F.col(col_name) >= 1.5) & (F.col(col_name) < 2.5), "Fair")
-                                .when((F.col(col_name) >= 2.5) & (F.col(col_name) < 3.5), "Good")
-                                .when(F.col(col_name) >= 3.5, "Excellent")
-                                .otherwise(None))
-        
-        categorical_columns = [
-                                    "ip_change_category", "steer_start_category", "steer_start_perHome_category",
-                                    "customer_reboot_category", "reboot_category", "modem_reset_category", "sudden_drop_category",
-                                    "RSSI_category", "phyrate_category", "Airtime_Utilization_Category"
-                                ]
-
-        for col_name in categorical_columns:
-            df_numeric = convert_to_numeric(df_numeric, col_name)
-
-        reliability_weights = { 
-                            "ip_change_category_numeric": 0.142, 
-                            
-                            "steer_start_category_numeric": 0.142, 
-                            "steer_start_perHome_category_numeric": 0.142, 
-                            
-                            "customer_reboot_category_numeric":0.142,
-                            "reboot_category_numeric":0.142,
-                            "modem_reset_category_numeric":0.142,
-                            
-                            "sudden_drop_category_numeric":0.142
-                            } 
-        score_calculator_reliability = ScoreCalculator(reliability_weights) 
-        reliability_score_udf = udf(score_calculator_reliability.calculate_score, FloatType()) 
-
-        speed_weights = { 
-                            "phyrate_category_numeric": 0.5, 
-                            "Airtime_Utilization_Category_numeric": 0.5, 
-                            }
-        score_calculator_speed = ScoreCalculator(speed_weights) 
-        speed_score_udf = udf(score_calculator_speed.calculate_score, FloatType()) 
-
-        df_score = df_numeric.withColumn("reliabilityScore", F.round( reliability_score_udf(*[F.col(c) for c in list( reliability_weights.keys() ) ] ),2) )\
-                            .withColumn("speedScore", F.round( speed_score_udf(*[F.col(c) for c in list( speed_weights.keys() ) ] ),2) )\
-                            .withColumn( "coverageScore", F.col("rssi_numeric") )
-                                    
-        for col_name in ["reliabilityScore","speedScore","coverageScore"]:
-            df_score = df_score.withColumn(f"numerical_{col_name}", F.col(col_name).cast('double'))
-            df_score = convert_to_categorical(df_score, col_name)
-
-
-        from pyspark.sql.types import StringType
-        # Define the function to find the worst score
-        def worst_score(reliabilityScore, speedScore, coverageScore):
-            # Define the priority mapping
-            score_priority = {"Poor": 1, "Fair": 2, "Good": 3, "Excellent": 4, None: 5}    
-            
-            # Create a list of scores and filter out None values
-            scores = [reliabilityScore, speedScore, coverageScore]
-            valid_scores = [score for score in scores if score is not None]
-            
-            # If there are no valid scores, return None
-            if not valid_scores:
-                return None
-            
-            # Find the score with the lowest priority number (the worst score)
-            worst = valid_scores[0]
-            for score in valid_scores[1:]:
-                if score_priority[score] < score_priority[worst]:
-                    worst = score
-            return worst
-        worst_score_udf = F.udf(worst_score, StringType())
-
-        df_score = df_score.withColumn("wifiScore", worst_score_udf(F.col("reliabilityScore"), F.col("speedScore"), F.col("coverageScore")))
-
-        df_score.filter( F.col("sn")!="G402121101548133" )\
-                .write.mode("overwrite").parquet(self.wifiscore_path)
+        wifi_score_df.write.mode("overwrite").parquet(f"{self.output_path}/{self.date_str}/{self.hour_str}")
+        return wifi_score_df
 
 if __name__ == "__main__":
-    spark = SparkSession.builder.appName('Zhe_wifi_score')\
+    spark = SparkSession.builder.appName('Zhe_bhr_wifi_score_hourly_report_v1')\
                         .config("spark.ui.port","24045")\
                         .getOrCreate()
-    email_sender = MailSender()
+
     
-    backfill_range = 1
-    parser = argparse.ArgumentParser(description="Inputs") 
-    parser.add_argument("--date", default=(date.today() - timedelta(0) ).strftime("%Y-%m-%d")) 
-    args_date = parser.parse_args().date
-    date_list = [( datetime.strptime( args_date, "%Y-%m-%d" )  - timedelta(days=i)).date() for i in range(backfill_range)][::-1]
+    date_str = "20250930"
+    hour_str = "15"
+    #station_connection_hourly
+    hdfs_pd = "hdfs://njbbvmaspd11.nss.vzwnet.com:9000/"
+    hdfs_pa =  'hdfs://njbbepapa1.nss.vzwnet.com:9000'
 
-    hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-    def process_kpi_data(date_list, email_sender):
-        for date_val in date_list:
-            file_date = date_val.strftime('%Y-%m-%d')
-            file_path = f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/crsp_wifiscore/{file_date}"
+    station_history_path = hdfs_pa + f"/sha_data/StationHistory/"
 
-            if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(file_path)):
-                print(f"data for {file_date} already exists.")
-                #continue
-
-            try:
-                date_compact = file_date.replace("-", "")
-
-                # Define paths directly with globals
-                env_configs = {
-                    "crsp": {
-                        "owl_path":        f"{hdfs_pa}/sha_data/OWLHistory/date={date_compact}",
-                        "station_history": f"{hdfs_pa}/sha_data/StationHistory/date={date_compact}",
-                        "deviceGroup":     f"{hdfs_pa}/sha_data/DeviceGroups/date={date_compact}",
-                        "df_rssi":         f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/crsp_df_rowkey_rssi_category/{file_date}",
-                        "df_phyrate":      f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/crsp_df_rowkey_phyrate_category/{file_date}",
-                        "wifiscore":       f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/crsp_wifiscore/{file_date}"
-                    },
-                    "pac": {
-                        "owl_path":        f"{hdfs_pa}/sha_data/purple_prod/bhrx_owlhistory/date={date_compact}",
-                        "station_history": f"{hdfs_pa}/sha_data/purple_prod/bhrx_stationhistory/date={date_compact}",
-                        "deviceGroup":     f"{hdfs_pa}/sha_data/purple_prod/bhrx_devicegroups/date={date_compact}",
-                        "df_rssi":         f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/pac_df_rowkey_rssi_category/{file_date}",
-                        "df_phyrate":      f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/pac_df_rowkey_phyrate_category/{file_date}",
-                        "wifiscore":       f"{hdfs_pd}/user/ZheS/wifi_score_v4/backup/pac_wifiscore/{file_date}"
-                    },
-                    "all": {
-                        "df_rssi":         f"{hdfs_pd}/user/ZheS/wifi_score_v4/df_rowkey_rssi_category/{file_date}",
-                        "df_phyrate":      f"{hdfs_pd}/user/ZheS/wifi_score_v4/df_rowkey_phyrate_category/{file_date}",
-                        "wifiscore":       f"{hdfs_pd}/user/ZheS/wifi_score_v4/KPI/{file_date}"
-                    },
-
-                }
-
-                # Loop over the selected environments
-                for env in  ["crsp", "pac"]:
-                    cfg = env_configs[env]
-                    analysis = wifiKPIAnalysis(
-                        date_val=date_val,
-                        owl_path=cfg["owl_path"],
-                        station_history_path=cfg["station_history"],
-                        deviceGroup_path=cfg["deviceGroup"],
-                        df_rssi_path=cfg["df_rssi"],
-                        df_phyrate_path=cfg["df_phyrate"],
-                        wifiscore_path=cfg["wifiscore"]
-                    )
-                    analysis.get_score()
-                    print(cfg["wifiscore"])
-
-                try:
-                    base_df = spark.read.parquet( env_configs["crsp"]["df_rssi"] )
-                    update_df = spark.read.parquet( env_configs["pac"]["df_rssi"] )
-                    replace_rows(base_df, update_df, "rowkey" ).write.mode("overwrite").parquet(env_configs["all"]["df_rssi"])
-                except:
-                    spark.read.parquet( env_configs["crsp"]["df_rssi"] ).write.mode("overwrite").parquet(env_configs["all"]["df_rssi"])
-
-                try:
-                    base_df = spark.read.parquet( env_configs["crsp"]["df_phyrate"] )
-                    update_df = spark.read.parquet( env_configs["pac"]["df_phyrate"] )
-                    replace_rows(base_df, update_df, "rowkey" ).write.mode("overwrite").parquet(env_configs["all"]["df_phyrate"])
-                except:
-                    spark.read.parquet( env_configs["crsp"]["df_rssi"] ).write.mode("overwrite").parquet(env_configs["all"]["df_phyrate"])
-
-                try:
-                    base_df = spark.read.parquet( env_configs["crsp"]["wifiscore"] )
-                    update_df = spark.read.parquet( env_configs["pac"]["wifiscore"] )
-                    replace_rows(base_df, update_df, "sn" ).write.mode("overwrite").parquet(env_configs["all"]["wifiscore"])
-                except:
-                    spark.read.parquet( env_configs["crsp"]["wifiscore"] ).write.mode("overwrite").parquet(env_configs["all"]["wifiscore"])
-
-                                
-                # location
-                location_df = spark.read.option("recursiveFileLookup", "true")\
-                                        .parquet(hdfs_pd + "/user/ZheS/wifi_score_v4/County_location")\
-                                        .select("sn","mdn","state","county", "latitude", "longitude")\
-                                        .distinct()\
-                                        .drop("wifiScore")
-
-                df_wifi = spark.read.parquet(hdfs_pd + f"/user/ZheS/wifi_score_v4/KPI/{file_date}")
-
-                df_wifi.withColumn("rowkey", F.concat(F.substring("sn", -4, 4), lit("-"), "sn"))\
-                        .join(location_df, "sn","left")\
-                        .write.mode("overwrite")\
-                        .parquet(hdfs_pd + f"/user/ZheS/wifi_score_v4/wifiScore_location/{file_date}")
-
-                # hdfs file
-                parquet_file = hdfs_pd + f"/user/ZheS/wifi_score_v4/KPI/{file_date}"
-                output_path = hdfs_pd + f"/user/ZheS/wifi_score_v4/aws/{file_date}"
-                models = ['ASK-NCQ1338', 'ASK-NCQ1338FA',"XCI55AX", 'WNC-CR200A', 'ASK-NCM1100', "CR1000A", "CR1000B"]
-
-                spark.read.parquet(parquet_file)\
-                    .filter( F.col("model_name").isin( models ) )\
-                    .drop("firmware")\
-                    .write.mode("overwrite")\
-                    .parquet(output_path)
-                """                """
-            except Exception as e:
-                error_message = ( f"wifiScore v4 failed at {file_date}\n\n{traceback.format_exc()}" )
-                print(error_message)
-                email_sender.send(
-                                    send_from=f"wifiKPIAnalysis@verizon.com",
-                                    subject=f"wifiKPIAnalysis failed !!! at {file_date}",
-                                    text=error_message
+    with LogTime() as timer:
+        processor = StationConnectionProcessor(
+            spark,
+            input_path= hdfs_pa + "/sha_data/StationHistory/",
+            output_path= hdfs_pa + "/sha_data//vz-bhr-athena/reports/station_connection_houry/",
+            date_str= date_str,
+            hour_str= hour_str
+        )
+        station_connection_df = processor.run()
+        station_connection_df = spark.read.parquet(f"{hdfs_pa}/sha_data//vz-bhr-athena/reports/station_connection_houry/")
+        
+    with LogTime() as timer:
+        ins = station_score_hourly(
+                                spark,
+                                date_str,
+                                hour_str,
+                                station_connection_df,
+                                output_path = hdfs_pa + f"/sha_data/vz-bhr-athena/reports/bhr_station_score_hourly_report_temp/"
                                 )
 
-    process_kpi_data(date_list, email_sender)
+        ins.run()
 
+    with LogTime() as timer:
+        wifi_score_runner = wifi_score_hourly(
+                                    spark,
+                                    date_str,
+                                    hour_str,
+                                    station_connection_df,
+                                    output_path = f"/sha_data/vz-bhr-athena/reports/bhr_wifi_score_hourly_report_v1/{date_str}/{hour_str}"
+                                        )
+        wifi_score_runner.run()
